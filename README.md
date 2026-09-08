@@ -58,6 +58,15 @@ python script/run_korquad_qa_experiment.py --chunks data/korquad/chunks.csv --qa
 모델을 바꾸려면 두 명령 모두 `--qwen-model` 하나만 지정합니다(`--qwen-tokenizer`,
 `--qa-model`은 호환용 별칭).
 
+Intrinsic의 `intrinsic_matched_cr.csv`는 목표 삭제율에 가장 가까운 Span 설정을
+기준으로 실제 삭제율이 가장 가까운 Token 설정을 짝짓습니다. 표에는 목표 삭제율,
+각 방법의 설정·실제 삭제율, 두 방법의 실제 CR 차이, 숫자·날짜·부정 단서 보존율,
+의미 유사도가 기록됩니다. 의미 유사도는 기본적으로
+`sentence-transformers/paraphrase-multilingual-mpnet-base-v2`의 임베딩 코사인
+유사도이며, 필요하면 `--similarity-model none`으로 끌 수 있습니다. 실제 CR 차이가
+`--max-cr-gap`보다 큰 쌍은 `pair_within_max_gap=false`로 표시하고 공정 비교에서
+제외합니다.
+
 Qwen3는 `transformers<4.51`에서 로드되지 않으므로 `requirements.txt`의 최소 버전을
 그대로 사용해야 합니다. QA는 비교 가능성을 위해 chat template의 thinking을 끄고
 greedy decoding을 사용합니다.

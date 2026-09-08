@@ -12,7 +12,7 @@ import gzip
 import json
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
@@ -32,7 +32,9 @@ DATE_RE = re.compile(
     r"\d{2,4}\s*년|\d{1,2}\s*월|\d{1,2}\s*일|"
     r"\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?"
 )
-NEGATION_CUES = ("안", "못", "않", "없", "아니", "말지", "않다", "않는")
+NEGATION_STEMS = ("않", "없", "아니", "말지")
+NEGATION_ADVERBS = frozenset(("안", "못"))
+TOKEN_EDGE_PUNCTUATION = ".,!?;:()[]{}<>\"'“”‘’…"
 
 
 def open_text(path: Path, mode: str = "rt"):
@@ -277,11 +279,17 @@ def _preservation(
     for row in rows:
         original = str(row["original"])
         compressed = str(row["compressed"])
-        items = extractor(original)
-        if items:
+        original_items = extractor(original)
+        compressed_items = extractor(compressed)
+        if original_items:
             supported += 1
-        total += len(items)
-        retained += sum(1 for item in items if _contains_item(compressed, item))
+        total += len(original_items)
+        original_counts = Counter(original_items)
+        compressed_counts = Counter(compressed_items)
+        retained += sum(
+            min(count, compressed_counts[item])
+            for item, count in original_counts.items()
+        )
     return {
         "retained": float(retained),
         "total": float(total),
@@ -291,23 +299,13 @@ def _preservation(
 
 
 def _negation_items(text: str) -> List[str]:
-    return [
-        token
-        for token in text.split()
-        if any(cue in token for cue in NEGATION_CUES)
-    ]
-
-
-def _contains_item(text: str, item: str) -> bool:
-    """Match an extracted item as a token-like span, not a substring."""
-    item = item.strip()
-    if not item:
-        return False
-    return re.search(
-        rf"(?<!\w){re.escape(item)}(?!\w)",
-        text,
-        flags=re.UNICODE,
-    ) is not None
+    """Extract rough lexical negation cues without common ``안`` false positives."""
+    items: List[str] = []
+    for raw_token in text.split():
+        token = raw_token.strip(TOKEN_EDGE_PUNCTUATION)
+        if token in NEGATION_ADVERBS or token.startswith(NEGATION_STEMS):
+            items.append(token)
+    return items
 
 
 def intrinsic_summary(

@@ -6,7 +6,8 @@ metrics, and a matched-deletion-rate table. The official LLMLingua-2 model is
 reserved for the KorQuAD QA experiment.
 
 The encoder probabilities are produced with ``predict_span_encoder.py`` from a
-local checkpoint.
+local checkpoint. The matched table pairs each Span setting with the Token
+setting having the closest *actual* Qwen-token deletion rate.
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ except ImportError:
 
 
 def _semantic_model(name: str | None):
-    if not name:
+    if not name or name.lower() in {"none", "off"}:
         return None
     try:
         from sentence_transformers import SentenceTransformer
@@ -94,45 +95,31 @@ def _paired_intrinsic(
         )
         token_row = min(
             token,
-            key=lambda row: (
-                abs(float(row["qwen_token_compression_ratio"]) - target),
-                -float(row.get("semantic_mean") or float("-inf")),
+            key=lambda row: abs(
+                float(row["qwen_token_compression_ratio"])
+                - float(span_row["qwen_token_compression_ratio"])
             ),
         )
+        span_cr = float(span_row["qwen_token_compression_ratio"])
+        token_cr = float(token_row["qwen_token_compression_ratio"])
+        cr_gap = abs(span_cr - token_cr)
         row: Dict[str, Any] = {
             "target_deletion_rate": target,
             "span_setting": span_row["setting"],
-            "span_actual_cr": span_row["qwen_token_compression_ratio"],
-            "span_cr_gap": abs(
-                float(span_row["qwen_token_compression_ratio"]) - target
-            ),
+            "span_actual_cr": span_cr,
             "token_setting": token_row["setting"],
-            "token_actual_cr": token_row["qwen_token_compression_ratio"],
-            "token_cr_gap": abs(
-                float(token_row["qwen_token_compression_ratio"]) - target
-            ),
+            "token_actual_cr": token_cr,
+            "actual_cr_gap": cr_gap,
+            "pair_within_max_gap": cr_gap <= max_cr_gap,
         }
-        row["max_cr_gap"] = max_cr_gap
-        row["pair_within_max_gap"] = (
-            row["span_cr_gap"] <= max_cr_gap
-            and row["token_cr_gap"] <= max_cr_gap
-        )
         for metric in (
             "number_retention",
             "date_retention",
             "negation_retention",
             "semantic_mean",
-            "semantic_p10",
-            "empty_output_rate",
         ):
-            s_value = span_row.get(metric, "")
-            l_value = token_row.get(metric, "")
-            row[f"span_{metric}"] = s_value
-            row[f"token_{metric}"] = l_value
-            if s_value == "" or l_value == "":
-                row[f"delta_{metric}_span_minus_token"] = ""
-            else:
-                row[f"delta_{metric}_span_minus_token"] = float(s_value) - float(l_value)
+            row[f"span_{metric}"] = span_row.get(metric, "")
+            row[f"token_{metric}"] = token_row.get(metric, "")
         rows.append(row)
     return rows
 
@@ -152,7 +139,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--similarity-model",
-        help="선택 사항. 지정하면 sentence-transformers semantic metrics도 계산합니다.",
+        default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        help=(
+            "의미 유사도 모델 (기본값: "
+            "sentence-transformers/paraphrase-multilingual-mpnet-base-v2; "
+            "끄려면 none)"
+        ),
     )
     parser.add_argument("--token-checkpoint", type=Path, required=True)
     parser.add_argument(
@@ -176,8 +168,8 @@ def main() -> None:
     parser.add_argument(
         "--max-cr-gap",
         type=float,
-        default=0.05,
-        help="matched CR 표에 허용할 목표 삭제율과의 최대 차이",
+        default=0.01,
+        help="matched CR 표에서 Span/Token 실제 삭제율 차이의 최대 허용값",
     )
     parser.add_argument("--max-samples", type=int, help="개발용 상한. 본 실험에서는 생략하세요.")
     args = parser.parse_args()
