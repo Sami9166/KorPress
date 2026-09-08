@@ -139,10 +139,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--similarity-model",
-        default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        default="dragonkue/BGE-m3-ko",
         help=(
             "의미 유사도 모델 (기본값: "
-            "sentence-transformers/paraphrase-multilingual-mpnet-base-v2; "
+            "dragonkue/BGE-m3-ko; "
             "끄려면 none)"
         ),
     )
