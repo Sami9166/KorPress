@@ -2,12 +2,14 @@
 
 The script starts from raw chunks, current Span encoder probabilities, and a
 same-size token classifier. It writes compressed examples, per-setting
-metrics, and a matched-deletion-rate table. The official LLMLingua-2 model is
-reserved for the KorQuAD QA experiment.
+metrics, and rule-by-rule matched-deletion-rate tables. Run it on the
+validation split to choose settings; run it again on the held-out test split
+for the final intrinsic table. The official LLMLingua-2 model is reserved for
+the KorQuAD QA experiment.
 
 The encoder probabilities are produced with ``predict_span_encoder.py`` from a
-local checkpoint. The matched table pairs each Span setting with the Token
-setting having the closest *actual* Qwen-token deletion rate.
+local checkpoint. The matched table pairs each Span ``drop_rule`` and target
+with the Token setting having the closest *actual* Qwen-token deletion rate.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ try:
         TokenCounter,
         DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
-        closest_rows,
         compress_span_chunks,
         compress_token_chunks,
         intrinsic_summary,
@@ -44,7 +45,6 @@ except ImportError:
         TokenCounter,
         DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
-        closest_rows,
         compress_span_chunks,
         compress_token_chunks,
         intrinsic_summary,
@@ -83,45 +83,105 @@ def _paired_intrinsic(
     if not span or not token:
         raise ValueError("Span과 Token baseline 결과가 모두 필요합니다.")
 
+    span_by_rule: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in span:
+        rule = str(row.get("drop_rule") or "max")
+        span_by_rule.setdefault(rule, []).append(row)
+
+    def semantic_value(row: Mapping[str, Any]) -> float:
+        raw = row.get("semantic_mean")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float("-inf")
+
     rows: List[Dict[str, Any]] = []
-    for selected in closest_rows(span, targets):
-        target = float(selected["target_deletion_rate"])
-        span_row = min(
-            span,
-            key=lambda row: (
-                abs(float(row["qwen_token_compression_ratio"]) - target),
-                -float(row.get("semantic_mean") or float("-inf")),
-            ),
-        )
-        token_row = min(
-            token,
-            key=lambda row: abs(
-                float(row["qwen_token_compression_ratio"])
-                - float(span_row["qwen_token_compression_ratio"])
-            ),
-        )
-        span_cr = float(span_row["qwen_token_compression_ratio"])
-        token_cr = float(token_row["qwen_token_compression_ratio"])
-        cr_gap = abs(span_cr - token_cr)
-        row: Dict[str, Any] = {
-            "target_deletion_rate": target,
-            "span_setting": span_row["setting"],
-            "span_actual_cr": span_cr,
-            "token_setting": token_row["setting"],
-            "token_actual_cr": token_cr,
-            "actual_cr_gap": cr_gap,
-            "pair_within_max_gap": cr_gap <= max_cr_gap,
-        }
-        for metric in (
-            "number_retention",
-            "date_retention",
-            "negation_retention",
-            "semantic_mean",
-        ):
-            row[f"span_{metric}"] = span_row.get(metric, "")
-            row[f"token_{metric}"] = token_row.get(metric, "")
-        rows.append(row)
+    for drop_rule in sorted(span_by_rule):
+        rule_rows = span_by_rule[drop_rule]
+        for target in targets:
+            target = float(target)
+            span_row = min(
+                rule_rows,
+                key=lambda row: (
+                    abs(float(row["qwen_token_compression_ratio"]) - target),
+                    -semantic_value(row),
+                ),
+            )
+            token_row = min(
+                token,
+                key=lambda row: (
+                    abs(
+                        float(row["qwen_token_compression_ratio"])
+                        - float(span_row["qwen_token_compression_ratio"])
+                    ),
+                    -semantic_value(row),
+                ),
+            )
+            span_cr = float(span_row["qwen_token_compression_ratio"])
+            token_cr = float(token_row["qwen_token_compression_ratio"])
+            cr_gap = abs(span_cr - token_cr)
+            row: Dict[str, Any] = {
+                "target_deletion_rate": target,
+                "span_drop_rule": drop_rule,
+                "span_L": span_row.get("L", ""),
+                "span_threshold": span_row.get("threshold", ""),
+                "span_setting": span_row["setting"],
+                "span_actual_cr": span_cr,
+                "span_target_cr_gap": abs(span_cr - target),
+                "token_threshold": token_row.get("threshold", ""),
+                "token_setting": token_row["setting"],
+                "token_actual_cr": token_cr,
+                "token_target_cr_gap": abs(token_cr - target),
+                "actual_cr_gap": cr_gap,
+                "max_cr_gap": max_cr_gap,
+                "pair_within_max_gap": cr_gap <= max_cr_gap,
+            }
+            for metric in (
+                "number_retention",
+                "date_retention",
+                "negation_retention",
+                "semantic_mean",
+            ):
+                row[f"span_{metric}"] = span_row.get(metric, "")
+                row[f"token_{metric}"] = token_row.get(metric, "")
+            rows.append(row)
     return rows
+
+
+def _selection_manifest(paired_rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten rule/target matches into settings consumable by the QA runner."""
+    manifest: List[Dict[str, Any]] = []
+    for row in paired_rows:
+        common = {
+            "target_deletion_rate": row["target_deletion_rate"],
+            "actual_cr_gap_span_token": row["actual_cr_gap"],
+            "pair_within_max_gap": row["pair_within_max_gap"],
+        }
+        manifest.append(
+            {
+                **common,
+                "method": "Span",
+                "drop_rule": row["span_drop_rule"],
+                "L": row["span_L"],
+                "threshold": row["span_threshold"],
+                "setting": row["span_setting"],
+                "actual_deletion_rate": row["span_actual_cr"],
+                "target_cr_gap": row["span_target_cr_gap"],
+            }
+        )
+        manifest.append(
+            {
+                **common,
+                "method": "Token",
+                "drop_rule": "",
+                "L": "",
+                "threshold": row["token_threshold"],
+                "setting": row["token_setting"],
+                "actual_deletion_rate": row["token_actual_cr"],
+                "target_cr_gap": row["token_target_cr_gap"],
+            }
+        )
+    return manifest
 
 
 def main() -> None:
@@ -156,7 +216,12 @@ def main() -> None:
     parser.add_argument("--token-max-length", type=int, default=512)
     parser.add_argument("--span-L", type=int, nargs="+", default=(1, 2, 4, 8), dest="span_lengths")
     parser.add_argument("--span-thresholds", type=float, nargs="+", default=(0.5, 0.7, 0.9))
-    parser.add_argument("--drop-rules", nargs="+", choices=("max", "mean", "min"), default=("max",))
+    parser.add_argument(
+        "--drop-rules",
+        nargs="+",
+        choices=("max", "mean", "min"),
+        default=("max", "mean", "min"),
+    )
     parser.add_argument(
         "--token-thresholds",
         type=float,
@@ -250,10 +315,9 @@ def main() -> None:
         summaries.append(summary)
 
     write_csv(output_dir / "intrinsic_summary.csv", summaries)
-    write_csv(
-        output_dir / "intrinsic_matched_cr.csv",
-        _paired_intrinsic(summaries, args.targets, args.max_cr_gap),
-    )
+    paired_rows = _paired_intrinsic(summaries, args.targets, args.max_cr_gap)
+    write_csv(output_dir / "intrinsic_matched_cr.csv", paired_rows)
+    write_csv(output_dir / "intrinsic_selected_settings.csv", _selection_manifest(paired_rows))
     (output_dir / "run_config.json").write_text(
         json.dumps(vars(args), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
