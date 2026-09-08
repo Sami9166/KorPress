@@ -1,0 +1,9 @@
+torch>=2.4
+transformers>=4.48,<6
+accelerate>=0.26
+safetensors>=0.4
+numpy>=1.26
+pandas>=2.0
+stanza>=1.8
+sentence-transformers>=3.0
+llmlingua>=0.2

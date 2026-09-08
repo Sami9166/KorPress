@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and notebooks
+.venv/
+venv/
+env/
+ENV/
+.ipynb_checkpoints/
+
+# Local experiment artifacts
+runs/
+outputs/
+checkpoints/
+external/
+wandb/
+mlruns/
+experiments/**/results/
+experiments/**/raw/
+
+# Model/checkpoint files
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.zip
+
+# External/private data
+data/raw/
+data/**/span_labels.csv
+data/**/span_labels.csv.gz
+data/**/chunk_eojeol_labels.csv
+data/**/chunk_eojeol_labels.csv.gz
+data/**/split_manifest.csv
+data/**/chunks.csv
+data/**/spans.jsonl
+data/**/qa_pairs.json
+data/**/korquad_*.gz
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
