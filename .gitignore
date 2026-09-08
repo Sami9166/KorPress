@@ -18,6 +18,8 @@ ENV/
 runs/
 outputs/
 checkpoints/
+prepared/
+grid_results/
 external/
 wandb/
 mlruns/
@@ -31,11 +33,15 @@ experiments/**/raw/
 *.safetensors
 *.ckpt
 *.zip
+encoder/
 
 # External/private data
 data/raw/
+data/prepared/
+data/selection_summary.csv
 data/**/span_labels.csv
 data/**/span_labels.csv.gz
+data/**/span_labels.csv.gz.tmp
 data/**/chunk_eojeol_labels.csv
 data/**/chunk_eojeol_labels.csv.gz
 data/**/split_manifest.csv

@@ -32,43 +32,13 @@ from typing import List, Dict, Any
 def assign_dummy_probs(spans: List[Dict[str, Any]], seed: int = 0) -> List[Dict[str, Any]]:
     """
     인코더 checkpoint가 아직 없을 때, 개발/테스트용으로 랜덤 p_drop을 부여.
-    실제 checkpoint가 나오면 predict_with_encoder()로 교체.
+    실제 checkpoint가 나오면 ``predict_span_encoder.py``의 확률 파일을 사용한다.
     """
     rng = random.Random(seed)
     out = []
     for s in spans:
         s = dict(s)
         s["p_drop"] = rng.random()
-        out.append(s)
-    return out
-
-
-def predict_with_encoder(spans: List[Dict[str, Any]], model, tokenizer, batch_size: int = 64):
-    """
-    (참고용) 표준 HuggingFace 분류 모델 형식을 가정한 추론 함수.
-    주의: 다슬님이 실제로 만든 모델은 이 형식이 아니라 커스텀
-    ContextualSpanClassifier(문맥 전체를 넣고 span 위치만 pooling)라
-    이 함수로는 안 맞는다. 실제 연동은 아래 load_real_predictions()를 사용할 것.
-    """
-    import torch
-
-    texts = [s["text"] for s in spans]
-    all_probs = []
-    model.eval()
-    with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            enc = tokenizer(batch_texts, truncation=True, max_length=64,
-                             padding=True, return_tensors="pt")
-            enc = {k: v.to(model.device) for k, v in enc.items()}
-            logits = model(**enc).logits
-            probs = torch.softmax(logits, dim=-1)[:, 1]  # index 1 = DROP class
-            all_probs.extend(probs.cpu().tolist())
-
-    out = []
-    for s, p in zip(spans, all_probs):
-        s = dict(s)
-        s["p_drop"] = p
         out.append(s)
     return out
 

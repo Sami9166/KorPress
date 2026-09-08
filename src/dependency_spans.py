@@ -55,7 +55,8 @@ def fix_go_root(words: List[Dict[str, Any]], max_iter: int = 5) -> List[Dict[str
             (
                 word
                 for word in reversed(sorted(words, key=lambda w: w["id"]))
-                if word.get("upos") not in {"PUNCT", "SYM"}
+                if not word.get("is_punct", False)
+                and word.get("upos") not in {"PUNCT", "SYM"}
             ),
             None,
         )
@@ -68,6 +69,47 @@ def fix_go_root(words: List[Dict[str, Any]], max_iter: int = 5) -> List[Dict[str
         last_word["deprel"] = "root"
 
     return words
+
+
+def _extract_sentence_words(stanza_sentence) -> List[Dict[str, Any]]:
+    """Convert one Stanza sentence to the project word schema."""
+    return [
+        {
+            "id": word.id,
+            "text": word.text,
+            "lemma": word.lemma,
+            "upos": word.upos,
+            "head": word.head,
+            "deprel": word.deprel,
+            "is_punct": word.upos == "PUNCT",
+        }
+        for word in stanza_sentence.words
+    ]
+
+
+def merge_multi_sentence_words(
+    sentence_word_lists: List[List[Dict[str, Any]]],
+    apply_go_fix: bool = True,
+) -> List[Dict[str, Any]]:
+    """Merge Stanza's sentence-level trees without dropping later sentences."""
+    merged: List[Dict[str, Any]] = []
+    offset = 0
+    for sentence_words in sentence_word_lists:
+        if not sentence_words:
+            continue
+        words = [dict(word) for word in sentence_words]
+        if apply_go_fix:
+            # Apply the correction before changing ids so it cannot cross a
+            # sentence boundary while looking for the final predicate.
+            words = fix_go_root(words)
+        local_max = max(word["id"] for word in words)
+        for word in words:
+            word["id"] += offset
+            if word["head"] != 0:
+                word["head"] += offset
+        merged.extend(words)
+        offset += local_max
+    return merged
 
 
 class KoreanDependencyParser:
@@ -84,46 +126,35 @@ class KoreanDependencyParser:
 
     def parse_sentence(self, sentence: str, apply_go_fix: bool = True) -> Dict[str, Any]:
         """
-        문장 하나를 파싱해서 표준 형식으로 반환.
+        한 문장 또는 여러 문장이 섞인 텍스트를 파싱해서 표준 형식으로 반환.
 
         반환 형식:
         {
             "sentence": "철수는 학교에 갔다",
             "words": [
                 {"id": 1, "text": "철수는", "lemma": "철수", "upos": "PROPN",
-                 "head": 3, "deprel": "nsubj"},
+                 "head": 3, "deprel": "nsubj", "is_punct": False},
                 ...
-            ]
+            ],
+            "multi_sentence_detected": False,
+            "num_stanza_sentences": 1,
         }
 
-        head=0은 root를 의미 (관례상 ROOT 노드의 id를 0으로 취급).
-        id는 문장 내에서 1부터 시작하는 표면 순서(surface order)와 동일하다.
-        따라서 "표면상 연속"인지 여부는 id의 연속성으로 바로 판단 가능하다.
+        여러 문장으로 분리되더라도 각 문장에 먼저 후처리를 적용한 뒤 id를
+        이어 붙인다. 따라서 뒤 문장을 조용히 버리지 않고, ``head=0`` root가
+        문장별로 유지된다.
         """
         doc = self.nlp(sentence)
         if not doc.sentences:
             raise ValueError("Stanza가 문장을 생성하지 못했습니다: 입력이 비어 있는지 확인하세요.")
-        if len(doc.sentences) != 1:
-            raise ValueError(
-                "parse_sentence는 한 문장만 받습니다. "
-                "여러 문장은 먼저 분리해 parse_document에 넘기세요."
-            )
-        sent = doc.sentences[0]
-        words = []
-        for w in sent.words:
-            words.append({
-                "id": w.id,
-                "text": w.text,
-                "lemma": w.lemma,
-                "upos": w.upos,
-                "head": w.head,      # 0이면 root
-                "deprel": w.deprel,
-            })
-
-        if apply_go_fix:
-            words = fix_go_root(words)
-
-        return {"sentence": sentence, "words": words}
+        sentence_word_lists = [_extract_sentence_words(sent) for sent in doc.sentences]
+        words = merge_multi_sentence_words(sentence_word_lists, apply_go_fix=apply_go_fix)
+        return {
+            "sentence": sentence,
+            "words": words,
+            "multi_sentence_detected": len(doc.sentences) > 1,
+            "num_stanza_sentences": len(doc.sentences),
+        }
 
     def parse_document(self, sentences: List[str], apply_go_fix: bool = True) -> List[Dict[str, Any]]:
         """여러 문장을 배치로 파싱."""
@@ -173,16 +204,57 @@ def generate_spans_for_L(words: List[Dict[str, Any]], L: int) -> List[Dict[str, 
                     "size": L,
                     "text": " ".join(text_of[word_id] for word_id in word_ids),
                     "word_ids": word_ids,
+                    "contains_punct": any(
+                        word.get("is_punct", False)
+                        for word in words
+                        if word["id"] in word_ids
+                    ),
                 }
             )
     return spans
 
 
+def generate_spans_up_to_L(words: List[Dict[str, Any]], max_L: int) -> List[Dict[str, Any]]:
+    """Return every valid span whose size is in ``1..max_L``."""
+    if not isinstance(max_L, int) or max_L < 1:
+        raise ValueError(f"L은 1 이상의 정수여야 합니다: {max_L!r}")
+    return [
+        span
+        for size in range(1, min(max_L, len(words)) + 1)
+        for span in generate_spans_for_L(words, size)
+    ]
+
+
 def generate_all_spans(
     words: List[Dict[str, Any]], L_values: List[int] = (1, 2, 4, 8)
 ) -> Dict[str, Any]:
-    """여러 L값의 span 후보를 크기별 딕셔너리로 반환한다."""
+    """여러 L값의 span 후보를 누적 풀(크기 1부터 L까지)로 반환한다."""
     return {
-        str(L): generate_spans_for_L(words, L) if L <= len(words) else []
+        str(L): generate_spans_up_to_L(words, L)
         for L in L_values
     }
+
+
+def self_test() -> bool:
+    """Run parser-independent regression checks for the span utilities."""
+    go_case = [
+        {"id": 1, "text": "먹고", "head": 0, "deprel": "root"},
+        {"id": 2, "text": "나갔다", "head": 1, "deprel": "parataxis"},
+    ]
+    fixed = fix_go_root([dict(word) for word in go_case])
+    assert next(word for word in fixed if word["deprel"] == "root")["text"] == "나갔다"
+
+    punct_case = go_case + [
+        {"id": 3, "text": ".", "head": 1, "deprel": "punct", "is_punct": True}
+    ]
+    fixed_punct = fix_go_root([dict(word) for word in punct_case])
+    assert next(word for word in fixed_punct if word["deprel"] == "root")["text"] == "나갔다"
+
+    words = [
+        {"id": 1, "text": "영희는", "head": 3, "deprel": "nsubj"},
+        {"id": 2, "text": "학교에", "head": 3, "deprel": "obl"},
+        {"id": 3, "text": "갔다", "head": 0, "deprel": "root"},
+    ]
+    sizes = sorted({span["size"] for span in generate_all_spans(words, [1, 2])["2"]})
+    assert sizes == [1, 2], f"L 누적 span 생성 실패: {sizes}"
+    return True

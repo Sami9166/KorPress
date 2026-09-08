@@ -17,11 +17,10 @@ import ast
 import csv
 import gzip
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 
 DEFAULT_TOKEN_MODEL = "klue/roberta-base"
@@ -95,13 +94,13 @@ def load_eojeol_labels(path: Path) -> Dict[str, Dict[int, int]]:
         "word_ids",
     )
     label_names = (
+        "eojeol_labels",
+        "labels",
         "eojeol_label",
         "word_label",
         "token_label",
         "label",
         "auto_label",
-        "eojeol_labels",
-        "labels",
     )
     result: Dict[str, Dict[int, int]] = {}
     with _open_text(path, "rt") as handle:
@@ -371,10 +370,3 @@ class TokenBaselineCompressor:
             "drop_probabilities": scores,
             "truncated_word_indices": truncated,
         }
-
-
-def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(dict(row), ensure_ascii=False) + "\n")

@@ -1,5 +1,5 @@
 torch>=2.4
-transformers>=4.48,<6
+transformers>=4.51,<6
 accelerate>=0.26
 safetensors>=0.4
 numpy>=1.26

@@ -2,9 +2,10 @@
 
 This entry point deliberately starts from the raw KorQuAD question file and
 the current encoder probabilities.  It does not merge, reuse, or post-process
-the old ``qa_eval``/``qa_results`` files.  For every compression setting it
-compresses the context, runs the same causal QA model on the original and
-compressed contexts, and writes both question-level and aggregate metrics.
+the old ``qa_eval``/``qa_results`` files.  Qwen3-8B is the default reader and
+tokenizer; for every compression setting it compresses the context, runs the
+same reader on the original and compressed contexts, and writes both
+question-level and aggregate metrics.
 
 The context used for compression is ``chunks.csv``.  That file is the source
 whose eojeol indices the dependency-span records refer to; the context string
@@ -16,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
+import time
 import sys
 import unicodedata
 from pathlib import Path
@@ -31,6 +34,7 @@ try:
         LLMLingua2Compressor,
         TokenBaselineCompressor,
         TokenCounter,
+        DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
         compress_ll2_chunks,
         compress_span_chunks,
@@ -45,6 +49,7 @@ except ImportError:
         LLMLingua2Compressor,
         TokenBaselineCompressor,
         TokenCounter,
+        DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
         compress_ll2_chunks,
         compress_span_chunks,
@@ -164,12 +169,22 @@ def answer_survives(answer: str, compressed_context: str) -> bool:
 
 
 def _prompt_text(context: str, question: str) -> str:
+    """Return the LLMLingua-2 LongBench QA template for Korean KorQuAD.
+
+    The GPT teacher prompt used to create ``span_labels.csv.gz`` is deliberately
+    not reused here: it is a data-generation instruction, whereas this prompt
+    is the downstream reader instruction applied to original and compressed
+    contexts alike.  The wrapper remains in the official English form; the
+    explicit Korean-output instruction keeps EM/F1 evaluation language-stable.
+    """
     return (
-        "다음 문맥만 근거로 질문에 대한 정답을 짧게 답하세요. "
-        "정답만 출력하고 설명은 쓰지 마세요.\n\n"
-        f"[문맥]\n{context}\n\n"
-        f"[질문]\n{question}\n\n"
-        "[정답]\n"
+        "Read the following text and answer briefly.\n\n"
+        f"{context}\n\n"
+        "Now, answer the following question based on the above text. "
+        "Only give me the answer and do not output any other words. "
+        "Answer in Korean.\n\n"
+        f"Question: {question}\n"
+        "Answer:"
     )
 
 
@@ -181,6 +196,7 @@ def _format_prompt(tokenizer: Any, context: str, question: str) -> str:
             [{"role": "user", "content": content}],
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
     return content
 
@@ -257,7 +273,60 @@ def generate_answer(
         answer_tokens = generated[0]
     else:
         answer_tokens = generated[0, input_length:]
-    return tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
+    answer = tokenizer.decode(answer_tokens, skip_special_tokens=True)
+    return re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+
+
+def _synchronize_device(device: Any) -> None:
+    """Synchronize CUDA before/after timing asynchronous generation kernels."""
+    try:
+        import torch
+    except ImportError:
+        return
+    device_type = getattr(device, "type", str(device))
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def generate_answer_timed(
+    model: Any,
+    tokenizer: Any,
+    device: Any,
+    context: str,
+    question: str,
+    max_input_tokens: int,
+    max_new_tokens: int,
+) -> Tuple[str, float]:
+    """Generate one answer and return wall-clock reader latency in seconds."""
+    _synchronize_device(device)
+    started = time.perf_counter()
+    answer = generate_answer(
+        model,
+        tokenizer,
+        device,
+        context,
+        question,
+        max_input_tokens,
+        max_new_tokens,
+    )
+    _synchronize_device(device)
+    return answer, time.perf_counter() - started
+
+
+def _latency_stats(values: Sequence[float]) -> Dict[str, float]:
+    """Summarize per-question reader latency without hiding the raw rows."""
+    if not values:
+        raise ValueError("latency 값이 없습니다.")
+    ordered = sorted(float(value) for value in values)
+    p95_index = min(len(ordered) - 1, max(0, math.ceil(0.95 * len(ordered)) - 1))
+    return {
+        "reader_latency_total_s": sum(ordered),
+        "reader_latency_mean_s": sum(ordered) / len(ordered),
+        "reader_latency_median_s": ordered[len(ordered) // 2]
+        if len(ordered) % 2
+        else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2,
+        "reader_latency_p95_s": ordered[p95_index],
+    }
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -288,6 +357,7 @@ def _evaluate_setting(
     passages: Sequence[Mapping[str, Any]],
     chunks: Mapping[str, str],
     original_predictions: Mapping[Tuple[str, str], str],
+    original_latencies: Mapping[Tuple[str, str], float],
     model: Any,
     tokenizer: Any,
     device: Any,
@@ -305,6 +375,7 @@ def _evaluate_setting(
     compressed_empty = 0
     answer_survival_count = 0
     question_count = 0
+    compressed_latencies: List[float] = []
 
     for passage in passages:
         passage_id = str(passage["passage_id"])
@@ -329,8 +400,10 @@ def _evaluate_setting(
             key = (passage_id, question_id)
             if key not in original_predictions:
                 raise KeyError(f"원문 QA 예측 캐시가 없습니다: {key}")
+            if key not in original_latencies:
+                raise KeyError(f"원문 QA latency 캐시가 없습니다: {key}")
             pred_original = original_predictions[key]
-            pred_compressed = generate_answer(
+            pred_compressed, compressed_latency = generate_answer_timed(
                 model,
                 tokenizer,
                 device,
@@ -339,6 +412,7 @@ def _evaluate_setting(
                 max_input_tokens,
                 max_new_tokens,
             )
+            compressed_latencies.append(compressed_latency)
             survives = answer_survives(answer, compressed)
             em_original = exact_match(pred_original, answer)
             em_compressed = exact_match(pred_compressed, answer)
@@ -362,6 +436,8 @@ def _evaluate_setting(
                     "gold": answer,
                     "pred_original": pred_original,
                     "pred_compressed": pred_compressed,
+                    "reader_latency_s_original": original_latencies[key],
+                    "reader_latency_s_compressed": compressed_latency,
                     "answer_survives_compression": survives,
                     "em_original": em_original,
                     "em_compressed": em_compressed,
@@ -416,7 +492,102 @@ def _evaluate_setting(
     }
     summary["em_delta"] = summary["em_compressed"] - summary["em_original"]
     summary["f1_delta"] = summary["f1_compressed"] - summary["f1_original"]
+    summary["em_loss"] = summary["em_original"] - summary["em_compressed"]
+    summary["f1_loss"] = summary["f1_original"] - summary["f1_compressed"]
+    summary["em_relative_loss"] = (
+        summary["em_loss"] / summary["em_original"]
+        if summary["em_original"]
+        else None
+    )
+    summary["f1_relative_loss"] = (
+        summary["f1_loss"] / summary["f1_original"]
+        if summary["f1_original"]
+        else None
+    )
+    summary.update(_latency_stats(compressed_latencies))
+    original_latency_stats = _latency_stats(
+        [original_latencies[(str(passage["passage_id"]), str(qa["question_id"]))]
+         for passage in passages
+         for qa in passage["qas"]]
+    )
+    for key, value in original_latency_stats.items():
+        summary[f"original_{key}"] = value
+    summary["reader_latency_mean_ratio_vs_original"] = (
+        summary["reader_latency_mean_s"] / original_latency_stats["reader_latency_mean_s"]
+        if original_latency_stats["reader_latency_mean_s"]
+        else None
+    )
+    summary["reader_latency_mean_delta_s_vs_original"] = (
+        summary["reader_latency_mean_s"] - original_latency_stats["reader_latency_mean_s"]
+    )
     return eval_passages, question_rows, summary
+
+
+def _original_summary(
+    passages: Sequence[Mapping[str, Any]],
+    chunks: Mapping[str, str],
+    predictions: Mapping[Tuple[str, str], str],
+    latencies: Mapping[Tuple[str, str], float],
+    qwen_model: str,
+) -> Dict[str, Any]:
+    """Build the no-compression QA baseline for the same test passages."""
+    em_values: List[float] = []
+    f1_values: List[float] = []
+    survival_values: List[float] = []
+    latency_values: List[float] = []
+    empty_predictions = 0
+    for passage in passages:
+        passage_id = str(passage["passage_id"])
+        context = chunks[passage_id]
+        for qa in passage["qas"]:
+            key = (passage_id, str(qa["question_id"]))
+            prediction = predictions[key]
+            latency_values.append(float(latencies[key]))
+            answer = str(qa["answer"])
+            em_values.append(float(exact_match(prediction, answer)))
+            f1_values.append(token_f1(prediction, answer))
+            survival_values.append(float(answer_survives(answer, context)))
+            empty_predictions += int(not prediction.strip())
+
+    n_questions = len(em_values)
+    if not n_questions:
+        raise ValueError("원문 QA baseline을 계산할 질문이 없습니다.")
+    em = sum(em_values) / n_questions
+    f1 = sum(f1_values) / n_questions
+    summary = {
+        "method": "Original",
+        "setting": "Original",
+        "n_passages": len(passages),
+        "n_questions": n_questions,
+        "qwen_token_compression_ratio": 0.0,
+        "eojeol_compression_ratio": 0.0,
+        "answer_survival_rate": sum(survival_values) / n_questions,
+        "empty_compressed_context_rate": 0.0,
+        "empty_prediction_rate": empty_predictions / n_questions,
+        "em_original": em,
+        "em_compressed": em,
+        "em_delta": 0.0,
+        "f1_original": f1,
+        "f1_compressed": f1,
+        "f1_delta": 0.0,
+        "em_loss": 0.0,
+        "f1_loss": 0.0,
+        "em_relative_loss": 0.0,
+        "f1_relative_loss": 0.0,
+        "L": "",
+        "threshold": "",
+        "drop_rule": "",
+        "retention_rate": "",
+        "qwen_model": qwen_model,
+    }
+    summary.update(_latency_stats(latency_values))
+    summary["original_reader_latency_total_s"] = summary["reader_latency_total_s"]
+    summary["original_reader_latency_mean_s"] = summary["reader_latency_mean_s"]
+    summary["original_reader_latency_median_s"] = summary["reader_latency_median_s"]
+    summary["original_reader_latency_p95_s"] = summary["reader_latency_p95_s"]
+    summary["reader_latency_mean_ratio_vs_original"] = 1.0
+    summary["reader_latency_mean_delta_s_vs_original"] = 0.0
+    return summary
 
 
 def _matched_qa(
@@ -477,16 +648,32 @@ def _matched_qa(
             "f1_compressed",
             "em_delta",
             "f1_delta",
+            "em_loss",
+            "f1_loss",
+            "em_relative_loss",
+            "f1_relative_loss",
             "empty_prediction_rate",
+            "reader_latency_mean_s",
+            "reader_latency_median_s",
+            "reader_latency_p95_s",
+            "reader_latency_mean_ratio_vs_original",
+            "reader_latency_mean_delta_s_vs_original",
         ):
-            s_value = float(span_row[metric])
-            t_value = float(token_row[metric])
-            l_value = float(ll2_row[metric])
+            s_raw = span_row.get(metric)
+            t_raw = token_row.get(metric)
+            l_raw = ll2_row.get(metric)
+            s_value = "" if s_raw in (None, "") else float(s_raw)
+            t_value = "" if t_raw in (None, "") else float(t_raw)
+            l_value = "" if l_raw in (None, "") else float(l_raw)
             row[f"span_{metric}"] = s_value
             row[f"token_{metric}"] = t_value
             row[f"ll2_{metric}"] = l_value
-            row[f"delta_{metric}_span_minus_token"] = s_value - t_value
-            row[f"delta_{metric}_span_minus_ll2"] = s_value - l_value
+            row[f"delta_{metric}_span_minus_token"] = (
+                "" if "" in (s_value, t_value) else s_value - t_value
+            )
+            row[f"delta_{metric}_span_minus_ll2"] = (
+                "" if "" in (s_value, l_value) else s_value - l_value
+            )
         rows.append(row)
     return rows
 
@@ -497,8 +684,14 @@ def main() -> None:
     parser.add_argument("--qa-pairs", type=Path, required=True)
     parser.add_argument("--span-records", type=Path, required=True)
     parser.add_argument("--span-predictions", type=Path, required=True)
-    parser.add_argument("--qa-model", required=True)
-    parser.add_argument("--qwen-tokenizer", required=True)
+    parser.add_argument(
+        "--qwen-model",
+        "--qa-model",
+        "--qwen-tokenizer",
+        dest="qwen_model",
+        default=DEFAULT_QWEN_MODEL,
+        help="QA reader와 CR tokenizer로 함께 사용할 모델 (기본값: Qwen/Qwen3-8B)",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
@@ -565,7 +758,7 @@ def main() -> None:
     records = read_jsonl(args.span_records)
     predictions = load_span_predictions(args.span_predictions)
     spans_by_chunk = build_spans_by_chunk(records, predictions, chunks)
-    token_counter = TokenCounter(args.qwen_tokenizer)
+    token_counter = TokenCounter(args.qwen_model)
 
     # Compress first and release each auxiliary encoder before loading the QA
     # reader. This matters on limited-GPU environments when the reader is larger.
@@ -623,17 +816,18 @@ def main() -> None:
     _release_model_memory()
 
     model, tokenizer, device = _load_qa_model(
-        args.qa_model,
+        args.qwen_model,
         args.device,
         args.torch_dtype,
     )
 
     original_predictions: Dict[Tuple[str, str], str] = {}
+    original_latencies: Dict[Tuple[str, str], float] = {}
     for passage in passages:
         passage_id = str(passage["passage_id"])
         for qa in passage["qas"]:
             question_id = str(qa["question_id"])
-            original_predictions[(passage_id, question_id)] = generate_answer(
+            prediction, latency = generate_answer_timed(
                 model,
                 tokenizer,
                 device,
@@ -642,10 +836,22 @@ def main() -> None:
                 args.max_input_tokens,
                 args.max_new_tokens,
             )
+            key = (passage_id, question_id)
+            original_predictions[key] = prediction
+            original_latencies[key] = latency
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    summaries: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = [
+        _original_summary(
+            passages,
+            chunks,
+            original_predictions,
+            original_latencies,
+            args.qwen_model,
+        )
+    ]
+    _write_json(output_dir / "qa_original_summary.json", summaries[0])
 
     def save_setting(
         setting: str,
@@ -660,6 +866,7 @@ def main() -> None:
             passages,
             chunks,
             original_predictions,
+            original_latencies,
             model,
             tokenizer,
             device,
@@ -675,6 +882,7 @@ def main() -> None:
             item["setting"] = setting
         if metadata:
             summary.update(metadata)
+        summary["qwen_model"] = args.qwen_model
         _write_json(output_dir / f"qa_eval_{setting}.json", eval_passages)
         _write_json(
             output_dir / f"qa_results_{setting}.json",
@@ -732,6 +940,13 @@ def main() -> None:
         {
             f"{passage_id}::{question_id}": prediction
             for (passage_id, question_id), prediction in original_predictions.items()
+        },
+    )
+    _write_json(
+        output_dir / "qa_original_latency.json",
+        {
+            f"{passage_id}::{question_id}": latency
+            for (passage_id, question_id), latency in original_latencies.items()
         },
     )
     _write_json(

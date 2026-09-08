@@ -5,8 +5,8 @@ same-size token classifier. It writes compressed examples, per-setting
 metrics, and a matched-deletion-rate table. The official LLMLingua-2 model is
 reserved for the KorQuAD QA experiment.
 
-The encoder probabilities can be produced with ``predict_span_probabilities.py``
-from the checkpoint supplied in the encoder bundle.
+The encoder probabilities are produced with ``predict_span_encoder.py`` from a
+local checkpoint.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ try:
     from experiment_runtime import (
         TokenBaselineCompressor,
         TokenCounter,
+        DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
         closest_rows,
         compress_span_chunks,
@@ -40,6 +41,7 @@ except ImportError:
     from .experiment_runtime import (
         TokenBaselineCompressor,
         TokenCounter,
+        DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
         closest_rows,
         compress_span_chunks,
@@ -141,7 +143,13 @@ def main() -> None:
     parser.add_argument("--span-records", type=Path, required=True)
     parser.add_argument("--span-predictions", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--qwen-tokenizer", required=True)
+    parser.add_argument(
+        "--qwen-model",
+        "--qwen-tokenizer",
+        dest="qwen_model",
+        default=DEFAULT_QWEN_MODEL,
+        help="CR 계산에 사용할 Qwen tokenizer (기본값: Qwen/Qwen3-8B)",
+    )
     parser.add_argument(
         "--similarity-model",
         help="선택 사항. 지정하면 sentence-transformers semantic metrics도 계산합니다.",
@@ -186,7 +194,7 @@ def main() -> None:
         raise ValueError("span-records와 chunks 사이에 평가할 sentence_id가 없습니다.")
     if args.max_samples is not None:
         sentence_ids = sentence_ids[: args.max_samples]
-    token_counter = TokenCounter(args.qwen_tokenizer)
+    token_counter = TokenCounter(args.qwen_model)
     semantic_model = _semantic_model(args.similarity_model)
     token = TokenBaselineCompressor(
         args.token_checkpoint,
@@ -221,6 +229,7 @@ def main() -> None:
                         "threshold": threshold,
                         "drop_rule": drop_rule,
                         "retention_rate": "",
+                        "qwen_model": args.qwen_model,
                     }
                 )
                 summaries.append(summary)
@@ -243,6 +252,7 @@ def main() -> None:
                 "threshold": threshold,
                 "drop_rule": "",
                 "retention_rate": "",
+                "qwen_model": args.qwen_model,
             }
         )
         summaries.append(summary)

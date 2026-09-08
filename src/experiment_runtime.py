@@ -24,6 +24,9 @@ except ImportError:  # Running as an imported package
     from .token_baseline import TokenBaselineCompressor
 
 
+# One reader/tokenizer keeps CR and QA results comparable across methods.
+DEFAULT_QWEN_MODEL = "Qwen/Qwen3-8B"
+
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:/-]\d+)*(?:\w*)")
 DATE_RE = re.compile(
     r"\d{2,4}\s*년|\d{1,2}\s*월|\d{1,2}\s*일|"
