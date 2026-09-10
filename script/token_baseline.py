@@ -1,11 +1,12 @@
-"""Train or run the same-size token baseline for Span-vs-Token experiments.
+"""Train or run the subword token baseline for Span-vs-Token experiments.
 
 Example::
 
     python script/token_baseline.py \
       --chunks data/aihub/chunks.csv \
-      --labels data/aihub/span_labels.csv.gz \
+      --labels data/subword_labels.csv.gz \
       --split-manifest data/aihub/split_manifest.csv \
+      --tokenizer-name encoder/klue_roberta_base_mean_max/best_model/tokenizer \
       --output-dir runs/token_klue_roberta_base
 
 Prediction example::
@@ -15,8 +16,10 @@ Prediction example::
       --chunks data/aihub/chunks.csv \
       --output runs/aihub/token_predictions.jsonl
 
-The default backbone/tokenizer is ``klue/roberta-base`` so that the only
-intended difference from the supplied Span encoder is the prediction unit.
+The default backbone/tokenizer is ``klue/roberta-base``.  Labels are read at
+subword level from ``subword_labels.csv.gz``; the legacy eojeol format remains
+supported with ``--label-unit word``.  Training and inference use the same
+utterance-centered max-length windows as the Span encoder.
 """
 
 from __future__ import annotations
@@ -34,7 +37,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from experiment_runtime import load_chunks, write_jsonl
-from token_baseline import DEFAULT_TOKEN_MODEL, TokenClassificationDataset, load_token_examples
+from token_baseline import (
+    DEFAULT_TOKEN_MODEL,
+    TokenClassificationDataset,
+    detect_label_unit,
+    load_token_examples,
+)
 
 
 def _set_seed(seed: int) -> None:
@@ -128,6 +136,7 @@ def _train_main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chunks", type=Path, required=True)
     parser.add_argument("--labels", type=Path, required=True)
+    parser.add_argument("--label-unit", choices=("auto", "subword", "word"), default="auto")
     parser.add_argument("--split-manifest", type=Path)
     parser.add_argument("--model-name", default=DEFAULT_TOKEN_MODEL)
     parser.add_argument("--tokenizer-name")
@@ -170,11 +179,13 @@ def _train_main(argv: Sequence[str] | None = None) -> None:
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("token baseline 학습에는 fast tokenizer가 필요합니다.")
 
+    resolved_label_unit = detect_label_unit(args.labels, args.label_unit)
     examples = load_token_examples(
         args.chunks,
         args.labels,
         args.split_manifest,
         seed=args.seed,
+        label_unit=resolved_label_unit,
     )
     train_examples = [example for example in examples if example.split == "train"]
     validation_examples = [example for example in examples if example.split == "validation"]
@@ -264,6 +275,7 @@ def _train_main(argv: Sequence[str] | None = None) -> None:
         "label_mapping": {"KEEP": 0, "DROP": 1},
         "chunks": str(args.chunks),
         "labels": str(args.labels),
+        "label_unit": resolved_label_unit,
         "split_manifest": str(args.split_manifest) if args.split_manifest else None,
         "seed": args.seed,
         "max_length": args.max_length,
@@ -288,7 +300,7 @@ def _train_main(argv: Sequence[str] | None = None) -> None:
 
 
 def _predict_main(argv: Sequence[str]) -> None:
-    parser = argparse.ArgumentParser(description="학습된 token baseline의 eojeol별 DROP 확률을 저장합니다.")
+    parser = argparse.ArgumentParser(description="학습된 token baseline의 subword별 DROP 확률을 저장합니다.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--tokenizer")
     parser.add_argument("--chunks", type=Path, required=True)

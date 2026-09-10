@@ -50,6 +50,13 @@ data/**/spans.jsonl
 data/**/qa_pairs.json
 data/**/korquad_*.gz
 
+# Subword teacher artifacts (keep data in Drive/external storage)
+data/chunk_eojeol_labels.csv.gz.tmp
+data/span_labels.csv.gz.tmp
+data/subword_teacher_input.jsonl
+data/subword_teacher_output.jsonl
+data/subword_labels.csv.gz
+
 # OS/editor
 .DS_Store
 Thumbs.db

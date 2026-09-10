@@ -176,7 +176,7 @@ def compress_token_chunks(
     threshold: float,
     sentence_ids: Sequence[str] | None = None,
 ) -> List[Dict[str, Any]]:
-    """Compress complete eojeols with the same-size token baseline."""
+    """Compress contexts with the subword baseline's Span-style windows."""
     selected = sentence_ids if sentence_ids is not None else list(chunks)
     rows: List[Dict[str, Any]] = []
     for sentence_id in selected:

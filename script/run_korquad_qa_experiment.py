@@ -1,4 +1,4 @@
-"""Run a fresh end-to-end KorQuAD evaluation for Span, Token, and LLMLingua-2.
+"""Run a calibrated end-to-end KorQuAD evaluation for Span and Token.
 
 This entry point deliberately starts from the raw KorQuAD question file and
 the current encoder probabilities.  It does not merge, reuse, or post-process
@@ -33,12 +33,10 @@ if str(SRC_DIR) not in sys.path:
 
 try:
     from experiment_runtime import (
-        LLMLingua2Compressor,
         TokenBaselineCompressor,
         TokenCounter,
         DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
-        compress_ll2_chunks,
         compress_span_chunks,
         compress_token_chunks,
         load_chunks,
@@ -48,12 +46,10 @@ try:
     )
 except ImportError:
     from .experiment_runtime import (
-        LLMLingua2Compressor,
         TokenBaselineCompressor,
         TokenCounter,
         DEFAULT_QWEN_MODEL,
         build_spans_by_chunk,
-        compress_ll2_chunks,
         compress_span_chunks,
         compress_token_chunks,
         load_chunks,
@@ -171,13 +167,13 @@ def answer_survives(answer: str, compressed_context: str) -> bool:
 
 
 def _prompt_text(context: str, question: str) -> str:
-    """Return the LLMLingua-2 LongBench QA template for Korean KorQuAD.
+    """Return the fixed reader prompt used for every compression method.
 
     The GPT teacher prompt used to create ``span_labels.csv.gz`` is deliberately
     not reused here: it is a data-generation instruction, whereas this prompt
     is the downstream reader instruction applied to original and compressed
-    contexts alike.  The wrapper remains in the official English form; the
-    explicit Korean-output instruction keeps EM/F1 evaluation language-stable.
+    contexts alike.  The explicit Korean-output instruction keeps EM/F1
+    evaluation language-stable.
     """
     return (
         "Read the following text and answer briefly.\n\n"
@@ -395,68 +391,122 @@ def _selection_row(
     }
 
 
-def _select_target_jobs(
-    jobs: Sequence[CompressionJob],
+def _calibration_pair_rows(
+    calibration_jobs: Sequence[CompressionJob],
     token_counter: TokenCounter,
     targets: Sequence[float],
-) -> Tuple[List[CompressionJob], List[Dict[str, Any]]]:
-    """Select one Span rule and one baseline setting per target CR.
-
-    Selection uses only compressed contexts and the Qwen tokenizer. It never
-    reads QA answers or reader predictions, so it is a compression calibration
-    step rather than a QA tuning step.
-    """
-    if not jobs:
-        raise ValueError("압축 후보가 없습니다.")
+    max_cr_gap: float,
+    target_tolerance: float,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], set[Tuple[str, str]]]:
+    """Search the full Span×Token candidate grid using contexts only."""
+    span_jobs = [job for job in calibration_jobs if job[1] == "Span"]
+    token_jobs = [job for job in calibration_jobs if job[1] == "Token"]
+    if not span_jobs or not token_jobs:
+        raise ValueError("calibration 후보에는 Span과 Token이 모두 필요합니다.")
 
     actual_by_key = {
         (method, setting): _actual_qwen_deletion_rate(rows, token_counter)
-        for setting, method, rows, _ in jobs
+        for setting, method, rows, _ in calibration_jobs
     }
-    span_jobs = [job for job in jobs if job[1] == "Span"]
-    token_jobs = [job for job in jobs if job[1] == "Token"]
-    ll2_jobs = [job for job in jobs if job[1] == "LLMLingua-2"]
-    if not span_jobs or not token_jobs or not ll2_jobs:
-        raise ValueError("Span, Token, LLMLingua-2 압축 후보가 모두 필요합니다.")
-
-    span_by_rule: Dict[str, List[CompressionJob]] = {}
-    for job in span_jobs:
-        rule = str(job[3].get("drop_rule") or "max")
-        span_by_rule.setdefault(rule, []).append(job)
-
     selected_keys: set[Tuple[str, str]] = set()
     selection_rows: List[Dict[str, Any]] = []
+    grid_rows: List[Dict[str, Any]] = []
 
-    def nearest(candidates: Sequence[CompressionJob], target: float) -> CompressionJob:
-        return min(
-            candidates,
-            key=lambda job: (
-                abs(actual_by_key[(job[1], job[0])] - target),
-                job[0],
-            ),
-        )
+    for raw_target in targets:
+        target = float(raw_target)
+        candidates: List[Tuple[Tuple[Any, ...], CompressionJob, CompressionJob, float, float]] = []
+        for span_job in span_jobs:
+            span_cr = actual_by_key[(span_job[1], span_job[0])]
+            for token_job in token_jobs:
+                token_cr = actual_by_key[(token_job[1], token_job[0])]
+                span_gap = abs(span_cr - target)
+                token_gap = abs(token_cr - target)
+                pair_gap = abs(span_cr - token_cr)
+                within = (
+                    span_gap <= target_tolerance
+                    and token_gap <= target_tolerance
+                    and pair_gap <= max_cr_gap
+                )
+                rank = (
+                    0 if within else 1,
+                    max(span_gap, token_gap),
+                    pair_gap,
+                    span_gap + token_gap,
+                    span_job[0],
+                    token_job[0],
+                )
+                candidates.append((rank, span_job, token_job, span_cr, token_cr))
+                grid_rows.append(
+                    {
+                        "target_deletion_rate": target,
+                        "span_setting": span_job[0],
+                        "span_L": span_job[3].get("L", ""),
+                        "span_drop_rule": span_job[3].get("drop_rule", ""),
+                        "span_threshold": span_job[3].get("threshold", ""),
+                        "span_calibration_cr": span_cr,
+                        "token_setting": token_job[0],
+                        "token_threshold": token_job[3].get("threshold", ""),
+                        "token_calibration_cr": token_cr,
+                        "span_target_gap": span_gap,
+                        "token_target_gap": token_gap,
+                        "span_token_cr_gap": pair_gap,
+                        "within_target_tolerance": (
+                            span_gap <= target_tolerance and token_gap <= target_tolerance
+                        ),
+                        "within_max_cr_gap": pair_gap <= max_cr_gap,
+                        "selected": False,
+                    }
+                )
 
-    for target in targets:
-        target = float(target)
-        for rule in sorted(span_by_rule):
-            setting, method, rows, metadata = nearest(span_by_rule[rule], target)
-            actual_cr = actual_by_key[(method, setting)]
-            selected_keys.add((method, setting))
-            selection_rows.append(
-                _selection_row(target, method, setting, rows, metadata, actual_cr)
+        _, span_job, token_job, span_cr, token_cr = min(candidates, key=lambda item: item[0])
+        selected_keys.add((span_job[1], span_job[0]))
+        selected_keys.add((token_job[1], token_job[0]))
+        pair_gap = abs(span_cr - token_cr)
+        for job, actual_cr in ((span_job, span_cr), (token_job, token_cr)):
+            setting, method, rows, metadata = job
+            row = _selection_row(target, method, setting, rows, metadata, actual_cr)
+            row.update(
+                {
+                    "calibration_actual_cr": actual_cr,
+                    "calibration_target_tolerance": target_tolerance,
+                    "selected_pair_cr_gap": pair_gap,
+                    "selected_pair_within_max_cr_gap": pair_gap <= max_cr_gap,
+                }
             )
-        for candidates in (token_jobs, ll2_jobs):
-            setting, method, rows, metadata = nearest(candidates, target)
-            actual_cr = actual_by_key[(method, setting)]
-            selected_keys.add((method, setting))
-            selection_rows.append(
-                _selection_row(target, method, setting, rows, metadata, actual_cr)
-            )
+            selection_rows.append(row)
+        for row in reversed(grid_rows):
+            if (
+                row["target_deletion_rate"] == target
+                and row["span_setting"] == span_job[0]
+                and row["token_setting"] == token_job[0]
+            ):
+                row["selected"] = True
+                break
+    return selection_rows, grid_rows, selected_keys
 
+
+def _select_target_jobs(
+    calibration_jobs: Sequence[CompressionJob],
+    evaluation_jobs: Sequence[CompressionJob],
+    token_counter: TokenCounter,
+    targets: Sequence[float],
+    max_cr_gap: float,
+    target_tolerance: float,
+) -> Tuple[List[CompressionJob], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Select full Span/Token hyperparameter combinations on calibration text."""
+    selection_rows, grid_rows, selected_keys = _calibration_pair_rows(
+        calibration_jobs,
+        token_counter,
+        targets,
+        max_cr_gap,
+        target_tolerance,
+    )
     selected_jobs = [
-        job for job in jobs if (job[1], job[0]) in selected_keys
+        job for job in evaluation_jobs if (job[1], job[0]) in selected_keys
     ]
-    return selected_jobs, selection_rows
+    if not selected_jobs:
+        raise ValueError("calibration에서 선택된 QA 후보가 없습니다.")
+    return selected_jobs, selection_rows, grid_rows
 
 
 def _all_job_selection_rows(
@@ -720,116 +770,111 @@ def _matched_qa(
     summaries: Sequence[Mapping[str, Any]],
     targets: Sequence[float],
     max_cr_gap: float,
+    selection_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     span = [row for row in summaries if row.get("method") == "Span"]
     token = [row for row in summaries if row.get("method") == "Token"]
-    ll2 = [row for row in summaries if row.get("method") == "LLMLingua-2"]
-    if not span or not token or not ll2:
-        raise ValueError("Span, Token, LLMLingua-2 결과가 모두 필요합니다.")
+    if not span or not token:
+        raise ValueError("Span과 Token 결과가 모두 필요합니다.")
 
-    span_by_rule: Dict[str, List[Mapping[str, Any]]] = {}
-    for row in span:
-        rule = str(row.get("drop_rule") or "max")
-        span_by_rule.setdefault(rule, []).append(row)
+    summary_by_key = {
+        (str(row.get("method")), str(row.get("setting"))): row
+        for row in summaries
+    }
+    selected_by_target: Dict[Tuple[float, str], Mapping[str, Any]] = {}
+    for row in selection_rows or []:
+        if row.get("target_deletion_rate", "") == "":
+            continue
+        selected_by_target[
+            (float(row["target_deletion_rate"]), str(row["method"]))
+        ] = row
+
+    def fallback_pair(target: float) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+        return min(
+            ((s, t) for s in span for t in token),
+            key=lambda pair: (
+                max(
+                    abs(float(pair[0]["qwen_token_compression_ratio"]) - target),
+                    abs(float(pair[1]["qwen_token_compression_ratio"]) - target),
+                ),
+                abs(
+                    float(pair[0]["qwen_token_compression_ratio"])
+                    - float(pair[1]["qwen_token_compression_ratio"])
+                ),
+            ),
+        )
 
     rows: List[Dict[str, Any]] = []
-    for target in targets:
-        target = float(target)
-        token_row = min(
-            token,
-            key=lambda row: abs(
-                float(row["qwen_token_compression_ratio"]) - target
-            ),
-        )
-        ll2_row = min(
-            ll2,
-            key=lambda row: abs(
-                float(row["qwen_token_compression_ratio"]) - target
-            ),
-        )
+    for raw_target in targets:
+        target = float(raw_target)
+        selected_span = selected_by_target.get((target, "Span"))
+        selected_token = selected_by_target.get((target, "Token"))
+        if selected_span and selected_token:
+            span_row = summary_by_key.get(("Span", str(selected_span["setting"])))
+            token_row = summary_by_key.get(("Token", str(selected_token["setting"])))
+        else:
+            span_row, token_row = fallback_pair(target)
+        if span_row is None or token_row is None:
+            raise ValueError(f"target={target}에 대응하는 QA summary가 없습니다.")
+
+        span_cr = float(span_row["qwen_token_compression_ratio"])
         token_cr = float(token_row["qwen_token_compression_ratio"])
-        ll2_cr = float(ll2_row["qwen_token_compression_ratio"])
-        for drop_rule in sorted(span_by_rule):
-            rule_rows = span_by_rule[drop_rule]
-            span_row = min(
-                rule_rows,
-                key=lambda row: abs(
-                    float(row["qwen_token_compression_ratio"]) - target
-                ),
+        span_target_gap = abs(span_cr - target)
+        token_target_gap = abs(token_cr - target)
+        span_token_gap = abs(span_cr - token_cr)
+        row: Dict[str, Any] = {
+            "target_deletion_rate": target,
+            "span_drop_rule": span_row.get("drop_rule", ""),
+            "span_L": span_row.get("L", ""),
+            "span_threshold": span_row.get("threshold", ""),
+            "span_setting": span_row["setting"],
+            "span_actual_cr": span_cr,
+            "span_cr_gap": span_target_gap,
+            "token_setting": token_row["setting"],
+            "token_threshold": token_row.get("threshold", ""),
+            "token_actual_cr": token_cr,
+            "token_cr_gap": token_target_gap,
+            "span_token_cr_gap": span_token_gap,
+            "max_cr_gap": max_cr_gap,
+            "pair_within_max_gap": span_token_gap <= max_cr_gap,
+            "span_calibration_cr": (
+                selected_span.get("calibration_actual_cr", "")
+                if selected_span
+                else ""
+            ),
+            "token_calibration_cr": (
+                selected_token.get("calibration_actual_cr", "")
+                if selected_token
+                else ""
+            ),
+        }
+        for metric in (
+            "answer_survival_rate",
+            "em_compressed",
+            "f1_compressed",
+            "em_delta",
+            "f1_delta",
+            "em_loss",
+            "f1_loss",
+            "em_relative_loss",
+            "f1_relative_loss",
+            "empty_prediction_rate",
+            "reader_latency_mean_s",
+            "reader_latency_median_s",
+            "reader_latency_p95_s",
+            "reader_latency_mean_ratio_vs_original",
+            "reader_latency_mean_delta_s_vs_original",
+        ):
+            s_raw = span_row.get(metric)
+            t_raw = token_row.get(metric)
+            s_value = "" if s_raw in (None, "") else float(s_raw)
+            t_value = "" if t_raw in (None, "") else float(t_raw)
+            row[f"span_{metric}"] = s_value
+            row[f"token_{metric}"] = t_value
+            row[f"delta_{metric}_span_minus_token"] = (
+                "" if "" in (s_value, t_value) else s_value - t_value
             )
-            span_cr = float(span_row["qwen_token_compression_ratio"])
-            span_target_gap = abs(span_cr - target)
-            token_target_gap = abs(token_cr - target)
-            ll2_target_gap = abs(ll2_cr - target)
-            span_token_gap = abs(span_cr - token_cr)
-            span_ll2_gap = abs(span_cr - ll2_cr)
-            token_ll2_gap = abs(token_cr - ll2_cr)
-            row: Dict[str, Any] = {
-                "target_deletion_rate": target,
-                "span_drop_rule": drop_rule,
-                "span_L": span_row.get("L", ""),
-                "span_threshold": span_row.get("threshold", ""),
-                "span_setting": span_row["setting"],
-                "span_actual_cr": span_cr,
-                "span_cr_gap": span_target_gap,
-                "token_setting": token_row["setting"],
-                "token_threshold": token_row.get("threshold", ""),
-                "token_actual_cr": token_cr,
-                "token_cr_gap": token_target_gap,
-                "ll2_setting": ll2_row["setting"],
-                "ll2_retention_rate": ll2_row.get("retention_rate", ""),
-                "ll2_actual_cr": ll2_cr,
-                "ll2_cr_gap": ll2_target_gap,
-                "span_token_cr_gap": span_token_gap,
-                "span_ll2_cr_gap": span_ll2_gap,
-                "token_ll2_cr_gap": token_ll2_gap,
-                "max_pairwise_cr_gap": max(
-                    span_token_gap, span_ll2_gap, token_ll2_gap
-                ),
-                "max_cr_gap": max_cr_gap,
-                "all_target_cr_gaps_within_max_gap": (
-                    span_target_gap <= max_cr_gap
-                    and token_target_gap <= max_cr_gap
-                    and ll2_target_gap <= max_cr_gap
-                ),
-                "pair_within_max_gap": max(
-                    span_token_gap, span_ll2_gap, token_ll2_gap
-                )
-                <= max_cr_gap,
-            }
-            for metric in (
-                "answer_survival_rate",
-                "em_compressed",
-                "f1_compressed",
-                "em_delta",
-                "f1_delta",
-                "em_loss",
-                "f1_loss",
-                "em_relative_loss",
-                "f1_relative_loss",
-                "empty_prediction_rate",
-                "reader_latency_mean_s",
-                "reader_latency_median_s",
-                "reader_latency_p95_s",
-                "reader_latency_mean_ratio_vs_original",
-                "reader_latency_mean_delta_s_vs_original",
-            ):
-                s_raw = span_row.get(metric)
-                t_raw = token_row.get(metric)
-                l_raw = ll2_row.get(metric)
-                s_value = "" if s_raw in (None, "") else float(s_raw)
-                t_value = "" if t_raw in (None, "") else float(t_raw)
-                l_value = "" if l_raw in (None, "") else float(l_raw)
-                row[f"span_{metric}"] = s_value
-                row[f"token_{metric}"] = t_value
-                row[f"ll2_{metric}"] = l_value
-                row[f"delta_{metric}_span_minus_token"] = (
-                    "" if "" in (s_value, t_value) else s_value - t_value
-                )
-                row[f"delta_{metric}_span_minus_ll2"] = (
-                    "" if "" in (s_value, l_value) else s_value - l_value
-                )
-            rows.append(row)
+        rows.append(row)
     return rows
 
 
@@ -839,6 +884,9 @@ def main() -> None:
     parser.add_argument("--qa-pairs", type=Path, required=True)
     parser.add_argument("--span-records", type=Path, required=True)
     parser.add_argument("--span-predictions", type=Path, required=True)
+    parser.add_argument("--calibration-chunks", type=Path)
+    parser.add_argument("--calibration-span-records", type=Path)
+    parser.add_argument("--calibration-span-predictions", type=Path)
     parser.add_argument(
         "--qwen-model",
         "--qa-model",
@@ -879,7 +927,6 @@ def main() -> None:
         default=(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
         help="Token encoder의 DROP 확률 threshold 목록",
     )
-    parser.add_argument("--ll2-model", default="microsoft/llmlingua-2-xlm-roberta-large-meetingbank")
     parser.add_argument("--span-L", type=int, nargs="+", default=(1, 2, 4, 8), dest="span_lengths")
     parser.add_argument("--span-thresholds", type=float, nargs="+", default=(0.5, 0.7, 0.9))
     parser.add_argument(
@@ -889,21 +936,19 @@ def main() -> None:
         default=("max", "mean", "min"),
         help="평가할 Span 점수 집계 규칙",
     )
-    parser.add_argument(
-        "--ll2-retention-rates",
-        type=float,
-        nargs="+",
-        default=(0.90, 0.78, 0.65),
-        help="LLMLingua-2 rate 인자(보존율). 삭제율이 아니라 retention rate입니다.",
-    )
     parser.add_argument("--targets", type=float, nargs="+", default=(0.10, 0.20, 0.30))
     parser.add_argument(
         "--max-cr-gap",
         type=float,
-        default=0.01,
-        help="matched CR 표에 허용할 실제 삭제율 차이",
+        default=0.02,
+        help="Span과 Token 사이에 허용할 실제 삭제율 차이",
     )
-    parser.add_argument("--force-reserve-digit", action="store_true")
+    parser.add_argument(
+        "--target-cr-tolerance",
+        type=float,
+        default=0.02,
+        help="각 후보가 목표 삭제율에 들어왔다고 볼 허용 오차",
+    )
     parser.add_argument(
         "--all-settings",
         action="store_true",
@@ -924,11 +969,42 @@ def main() -> None:
     records = read_jsonl(args.span_records)
     predictions = load_span_predictions(args.span_predictions)
     spans_by_chunk = build_spans_by_chunk(records, predictions, chunks)
+    calibration_args = (
+        args.calibration_chunks,
+        args.calibration_span_records,
+        args.calibration_span_predictions,
+    )
+    if any(value is not None for value in calibration_args) and not all(
+        value is not None for value in calibration_args
+    ):
+        raise ValueError(
+            "calibration을 지정할 때는 --calibration-chunks, "
+            "--calibration-span-records, --calibration-span-predictions를 "
+            "모두 지정해야 합니다."
+        )
+    calibration_chunks_path = args.calibration_chunks or args.chunks
+    calibration_records_path = args.calibration_span_records or args.span_records
+    calibration_predictions_path = args.calibration_span_predictions or args.span_predictions
+    calibration_chunks = load_chunks(calibration_chunks_path)
+    calibration_records = read_jsonl(calibration_records_path)
+    calibration_predictions = load_span_predictions(calibration_predictions_path)
+    calibration_spans_by_chunk = build_spans_by_chunk(
+        calibration_records,
+        calibration_predictions,
+        calibration_chunks,
+    )
+    if args.calibration_chunks is None:
+        print(
+            "주의: 별도 calibration 문맥이 없어 QA 문맥을 calibration에도 사용합니다.",
+            flush=True,
+        )
     token_counter = TokenCounter(args.qwen_model)
 
     # Compress first and release each auxiliary encoder before loading the QA
     # reader. This matters on limited-GPU environments when the reader is larger.
-    jobs: List[CompressionJob] = []
+    evaluation_jobs: List[CompressionJob] = []
+    calibration_jobs: List[CompressionJob] = []
+    calibration_ids = list(calibration_chunks)
     token = TokenBaselineCompressor(
         args.token_checkpoint,
         tokenizer_name=args.tokenizer,
@@ -937,7 +1013,26 @@ def main() -> None:
     )
     for threshold in args.token_thresholds:
         setting = f"Token_t{threshold:g}"
-        jobs.append(
+        metadata = {
+            "L": "",
+            "threshold": threshold,
+            "drop_rule": "",
+            "retention_rate": "",
+        }
+        calibration_jobs.append(
+            (
+                setting,
+                "Token",
+                compress_token_chunks(
+                    calibration_chunks,
+                    token,
+                    threshold=threshold,
+                    sentence_ids=calibration_ids,
+                ),
+                metadata,
+            )
+        )
+        evaluation_jobs.append(
             (
                 setting,
                 "Token",
@@ -947,46 +1042,38 @@ def main() -> None:
                     threshold=threshold,
                     sentence_ids=passage_ids,
                 ),
-                {
-                    "L": "",
-                    "threshold": threshold,
-                    "drop_rule": "",
-                    "retention_rate": "",
-                },
+                metadata,
             )
         )
     del token
-    _release_model_memory()
-
-    ll2 = LLMLingua2Compressor(args.ll2_model, args.force_reserve_digit)
-    for retention_rate in args.ll2_retention_rates:
-        setting = f"LLMLingua2_r{retention_rate:g}"
-        jobs.append(
-            (
-                setting,
-                "LLMLingua-2",
-                compress_ll2_chunks(
-                    chunks,
-                    ll2,
-                    retention_rate=retention_rate,
-                    sentence_ids=passage_ids,
-                ),
-                {
-                    "L": "",
-                    "threshold": "",
-                    "drop_rule": "",
-                    "retention_rate": retention_rate,
-                },
-            )
-        )
-    del ll2
     _release_model_memory()
 
     for drop_rule in args.drop_rules:
         for length in args.span_lengths:
             for threshold in args.span_thresholds:
                 setting = f"Span_{drop_rule}_L{length}_t{threshold:g}"
-                jobs.append(
+                metadata = {
+                    "L": length,
+                    "threshold": threshold,
+                    "drop_rule": drop_rule,
+                    "retention_rate": "",
+                }
+                calibration_jobs.append(
+                    (
+                        setting,
+                        "Span",
+                        compress_span_chunks(
+                            calibration_chunks,
+                            calibration_spans_by_chunk,
+                            L=length,
+                            threshold=threshold,
+                            drop_rule=drop_rule,
+                            sentence_ids=calibration_ids,
+                        ),
+                        metadata,
+                    )
+                )
+                evaluation_jobs.append(
                     (
                         setting,
                         "Span",
@@ -998,29 +1085,30 @@ def main() -> None:
                             drop_rule=drop_rule,
                             sentence_ids=passage_ids,
                         ),
-                        {
-                            "L": length,
-                            "threshold": threshold,
-                            "drop_rule": drop_rule,
-                            "retention_rate": "",
-                        },
+                        metadata,
                     )
                 )
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.all_settings:
-        selected_jobs = list(jobs)
-        selection_rows = _all_job_selection_rows(jobs, token_counter)
+        selected_jobs = list(evaluation_jobs)
+        selection_rows = _all_job_selection_rows(evaluation_jobs, token_counter)
+        calibration_grid: List[Dict[str, Any]] = []
     else:
-        selected_jobs, selection_rows = _select_target_jobs(
-            jobs,
+        selected_jobs, selection_rows, calibration_grid = _select_target_jobs(
+            calibration_jobs,
+            evaluation_jobs,
             token_counter,
             args.targets,
+            args.max_cr_gap,
+            args.target_cr_tolerance,
         )
     write_csv(output_dir / "qa_selected_settings.csv", selection_rows)
+    if calibration_grid:
+        write_csv(output_dir / "qa_calibration_grid.csv", calibration_grid)
     print(
-        f"QA 압축 후보 {len(jobs)}개 중 {len(selected_jobs)}개 설정을 reader 평가합니다.",
+        f"QA 압축 후보 {len(evaluation_jobs)}개 중 {len(selected_jobs)}개 설정을 reader 평가합니다.",
         flush=True,
     )
 
@@ -1105,7 +1193,12 @@ def main() -> None:
     write_csv(output_dir / "qa_summary.csv", summaries)
     write_csv(
         output_dir / "qa_matched_cr.csv",
-        _matched_qa(summaries, args.targets, args.max_cr_gap),
+        _matched_qa(
+            summaries,
+            args.targets,
+            args.max_cr_gap,
+            selection_rows,
+        ),
     )
     _write_json(
         output_dir / "qa_original_predictions.json",
