@@ -505,14 +505,12 @@ def _normalise_parser_words(parsed_words: Sequence[Mapping[str, Any]]) -> str:
     return " ".join(str(word["text"]) for word in parsed_words)
 
 
-def _span_record(
+def _span_record_from_words(
     sentence_id: str,
-    parser: KoreanDependencyParser,
-    text: str,
+    words: Sequence[Mapping[str, Any]],
     max_span_length: int,
 ) -> tuple[str, dict[str, Any], int]:
-    parsed = parser.parse_sentence(text)
-    words = parsed["words"]
+    """Build a prediction record from already parsed dependency words."""
     if not words:
         raise ValueError(f"dependency parser가 빈 chunk를 반환했습니다: {sentence_id}")
 
@@ -542,6 +540,69 @@ def _span_record(
         "spans": output_spans,
     }
     return _normalise_parser_words(words), record, len(output_spans)
+
+
+def _safe_split_boundary(
+    begin: int,
+    end: int,
+    protected: Sequence[tuple[int, int]],
+) -> int | None:
+    """Choose a word boundary that does not split a protected answer span."""
+    candidates = [
+        boundary
+        for boundary in range(begin + 1, end)
+        if all(not (start < boundary < finish) for start, finish in protected)
+    ]
+    if not candidates:
+        return None
+    midpoint = (begin + end) // 2
+    return min(candidates, key=lambda boundary: abs(boundary - midpoint))
+
+
+def _fit_dependency_windows(
+    words: Sequence[str],
+    initial_windows: Sequence[tuple[int, int]],
+    protected: Sequence[tuple[int, int]],
+    parser: KoreanDependencyParser,
+    tokenizer: Any,
+    max_context_tokens: int,
+) -> list[tuple[int, int, str, Sequence[Mapping[str, Any]], int]]:
+    """Parse windows and recursively split any parser-expanded window.
+
+    The first partition is measured before dependency parsing.  Stanza can
+    split an input eojeol into more parser words, so the post-parser text is
+    measured again and split at safe word boundaries until it fits the same
+    tokenizer budget.
+    """
+    fitted: list[tuple[int, int, str, Sequence[Mapping[str, Any]], int]] = []
+
+    def visit(begin: int, end: int) -> None:
+        parsed = parser.parse_sentence(" ".join(words[begin:end]))
+        parsed_words = parsed["words"]
+        sentence = _normalise_parser_words(parsed_words)
+        observed_tokens = len(
+            tokenizer(sentence, add_special_tokens=False)["input_ids"]
+        )
+        if observed_tokens <= max_context_tokens:
+            fitted.append((begin, end, sentence, parsed_words, observed_tokens))
+            return
+        if end - begin <= 1:
+            raise ValueError(
+                "dependency tokenization 후 한 어절이 context budget을 초과했습니다: "
+                f"pieces={observed_tokens}, budget={max_context_tokens}"
+            )
+        split = _safe_split_boundary(begin, end, protected)
+        if split is None:
+            raise ValueError(
+                "dependency tokenization 후 정답 span을 보존하면서 chunk를 나눌 수 없습니다: "
+                f"pieces={observed_tokens}, budget={max_context_tokens}"
+            )
+        visit(begin, split)
+        visit(split, end)
+
+    for begin, end in initial_windows:
+        visit(begin, end)
+    return fitted
 
 
 def _qa_payload(
@@ -602,7 +663,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-context-tokens",
         type=int,
-        default=3500,
+        default=3000,
         help="각 chunk의 tokenizer token 상한(질문/prompt 여유를 남김)",
     )
     parser.add_argument(
@@ -741,9 +802,17 @@ def main() -> None:
         ]
         if not usable_questions:
             continue
-        windows = _partition_words(
+        initial_windows = _partition_words(
             counts,
             [question.word_interval for question in usable_questions if question.word_interval],
+            args.max_context_tokens,
+        )
+        windows = _fit_dependency_windows(
+            words,
+            initial_windows,
+            protected,
+            dependency_parser,
+            tokenizer,
             args.max_context_tokens,
         )
         context_gold_qas: list[dict[str, Any]] = []
@@ -758,7 +827,7 @@ def main() -> None:
             }
         )
 
-        for window_index, (begin, end) in enumerate(windows):
+        for window_index, (begin, end, sentence, parsed_words, observed_tokens) in enumerate(windows):
             window_questions = [
                 question
                 for question in usable_questions
@@ -769,21 +838,11 @@ def main() -> None:
             if not window_questions:
                 continue
             sentence_id = f"korquad_{context.context_index:06d}_w{window_index:04d}"
-            raw_window_text = " ".join(words[begin:end])
-            sentence, record, record_span_count = _span_record(
+            sentence, record, record_span_count = _span_record_from_words(
                 sentence_id,
-                dependency_parser,
-                raw_window_text,
+                parsed_words,
                 args.max_span_length,
             )
-            observed_tokens = len(
-                tokenizer(sentence, add_special_tokens=False)["input_ids"]
-            )
-            if observed_tokens > args.max_context_tokens:
-                raise ValueError(
-                    "dependency tokenization 후 chunk가 context budget을 초과했습니다: "
-                    f"{sentence_id} ({observed_tokens} > {args.max_context_tokens})"
-                )
             max_observed_context_tokens = max(
                 max_observed_context_tokens, observed_tokens
             )
