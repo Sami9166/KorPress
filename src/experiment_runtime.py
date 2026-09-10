@@ -35,6 +35,7 @@ DATE_RE = re.compile(
 NEGATION_STEMS = ("않", "없", "아니", "말지")
 NEGATION_ADVERBS = frozenset(("안", "못"))
 TOKEN_EDGE_PUNCTUATION = ".,!?;:()[]{}<>\"'“”‘’…"
+PUNCTUATION_ONLY_RE = re.compile(r"[^\w\s]+", flags=re.UNICODE)
 
 
 def open_text(path: Path, mode: str = "rt"):
@@ -156,6 +157,11 @@ def compress_span_chunks(
     for sentence_id in selected:
         original = chunks[sentence_id]
         words = [{"id": i + 1, "text": word} for i, word in enumerate(original.split())]
+        protected_word_ids = {
+            word["id"]
+            for word in words
+            if PUNCTUATION_ONLY_RE.fullmatch(str(word["text"]))
+        }
         result = compress(
             words,
             list(spans_by_chunk.get(sentence_id, [])),
@@ -163,6 +169,7 @@ def compress_span_chunks(
             threshold=threshold,
             use_dummy=False,
             drop_rule=drop_rule,
+            protected_word_ids=protected_word_ids,
         )
         result["sentence_id"] = sentence_id
         result["method"] = "Span"
@@ -176,7 +183,12 @@ def compress_token_chunks(
     threshold: float,
     sentence_ids: Sequence[str] | None = None,
 ) -> List[Dict[str, Any]]:
-    """Compress contexts with the subword baseline's Span-style windows."""
+    """Compress contexts with target-only subword scoring windows.
+
+    Neighboring utterances are encoder context; only the target utterance's
+    subwords are scored and removed. Punctuation-only subword pieces are kept
+    by ``TokenBaselineCompressor`` to match the controlled Span policy.
+    """
     selected = sentence_ids if sentence_ids is not None else list(chunks)
     rows: List[Dict[str, Any]] = []
     for sentence_id in selected:
@@ -189,63 +201,6 @@ def compress_token_chunks(
                 "original": original,
                 "compressed": compressed,
                 "threshold": threshold,
-                "n_words_original": len(original.split()),
-                "n_words_compressed": len(compressed.split()),
-                "n_words_dropped": len(original.split()) - len(compressed.split()),
-            }
-        )
-    return rows
-
-
-class LLMLingua2Compressor:
-    """Thin adapter around the official LLMLingua-2 PromptCompressor API."""
-
-    def __init__(
-        self,
-        model_name: str = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
-        force_reserve_digit: bool = False,
-    ) -> None:
-        try:
-            from llmlingua import PromptCompressor
-        except ImportError as exc:
-            raise RuntimeError(
-                "LLMLingua-2 baseline에는 llmlingua 패키지가 필요합니다."
-            ) from exc
-        self.compressor = PromptCompressor(
-            model_name=model_name,
-            use_llmlingua2=True,
-        )
-        self.force_reserve_digit = force_reserve_digit
-
-    def compress(self, text: str, retention_rate: float) -> str:
-        if not 0 < retention_rate <= 1:
-            raise ValueError(f"LLMLingua-2 retention rate는 (0, 1]이어야 합니다: {retention_rate}")
-        result = self.compressor.compress_prompt(
-            text,
-            rate=retention_rate,
-            force_reserve_digit=self.force_reserve_digit,
-        )
-        return str(result["compressed_prompt"])
-
-
-def compress_ll2_chunks(
-    chunks: Mapping[str, str],
-    compressor: LLMLingua2Compressor,
-    retention_rate: float,
-    sentence_ids: Sequence[str] | None = None,
-) -> List[Dict[str, Any]]:
-    selected = sentence_ids if sentence_ids is not None else list(chunks)
-    rows: List[Dict[str, Any]] = []
-    for sentence_id in selected:
-        original = chunks[sentence_id]
-        compressed = compressor.compress(original, retention_rate)
-        rows.append(
-            {
-                "sentence_id": sentence_id,
-                "method": "LLMLingua-2",
-                "original": original,
-                "compressed": compressed,
-                "retention_rate": retention_rate,
                 "n_words_original": len(original.split()),
                 "n_words_compressed": len(compressed.split()),
                 "n_words_dropped": len(original.split()) - len(compressed.split()),

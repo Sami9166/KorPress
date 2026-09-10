@@ -10,9 +10,9 @@ compressor.py
 구현·검증해두고, checkpoint가 나오면 predict_with_encoder()만 실제
 모델 추론으로 갈아끼우면 된다.
 
-충돌 처리 규칙 (팀 합의 사항):
-    상위(더 큰) span이 DROP이면, 그 안에 포함된 하위 span은 판정과 무관하게
-    강제 DROP. 상위가 KEEP이면 하위는 각자 자기 판정을 따른다.
+``max`` 규칙은 threshold를 넘은 큰 span을 먼저 확정하고, 그 안에 완전히
+포함되는 작은 span을 강제 DROP한다. 최종 삭제 어절은 최종 DROP span들의
+word_ids 합집합으로 계산한다.
 
 사용법:
     python compressor.py --demo                 # 더미 확률로 데모
@@ -185,8 +185,8 @@ def compute_word_scores(spans: List[Dict[str, Any]], mode: str = "max") -> Dict[
     어절 id -> 집계된 p_drop 점수. 어절 하나는 여러 span(크기 1~L)에 동시에
     포함될 수 있으므로, 그 span들의 p_drop을 어떻게 합칠지가 mode.
 
-    - max  (기본값, 지금까지 쓰던 규칙): 포함하는 span 중 하나라도 DROP 확신이면 삭제.
-           큰 span은 "지우는 방향"으로만 작동 -> L을 키워도 결과가 거의 안 바뀜.
+    - max  (호환용 진단): 포함하는 span 중 가장 큰 p_drop을 반환한다.
+           실제 max 압축 결정은 resolve_conflicts()가 담당한다.
     - mean: 포함하는 모든 span의 평균. 큰 span이 KEEP이면 평균을 끌어내려
             어절을 보호하는 효과가 생김 (양방향 작동).
     - min : 포함하는 모든 span이 전부 DROP이어야 삭제. 가장 강한 보호.
@@ -207,17 +207,25 @@ def compute_word_scores(spans: List[Dict[str, Any]], mode: str = "max") -> Dict[
 
 def compute_final_drop_word_ids_by_rule(spans: List[Dict[str, Any]], threshold: float,
                                          mode: str = "max") -> set:
-    """mode에 따라 어절 단위로 직접 삭제 여부를 결정 (resolve_conflicts를 거치지 않음)."""
+    """mean/min 규칙의 어절 집계 결과로 삭제 어절을 계산한다."""
+    if mode == "max":
+        raise ValueError("max 규칙은 resolve_conflicts()를 통해 계산해야 합니다.")
     scores = compute_word_scores(spans, mode)
     return {w for w, v in scores.items() if v >= threshold}
 
 
-def compress_sentence(words: List[Dict[str, Any]], drop_word_ids: set) -> Dict[str, Any]:
+def compress_sentence(
+    words: List[Dict[str, Any]],
+    drop_word_ids: set,
+    protected_word_ids: set | None = None,
+) -> Dict[str, Any]:
     """
     words: [{"id":1,"text":"철수는",...}, ...] (dependency_spans 표준 형식)
     drop_word_ids: 삭제 확정된 word id 집합
     """
-    kept = [w for w in words if w["id"] not in drop_word_ids]
+    protected = set(protected_word_ids or ())
+    effective_drop_ids = set(drop_word_ids) - protected
+    kept = [w for w in words if w["id"] not in effective_drop_ids]
     compressed_text = " ".join(w["text"] for w in kept)
     original_text = " ".join(w["text"] for w in words)
 
@@ -248,10 +256,10 @@ def compress_sentence(words: List[Dict[str, Any]], drop_word_ids: set) -> Dict[s
 # ============================================================
 
 def compress(words, spans, L: int, threshold: float, use_dummy: bool = True, seed: int = 0,
-             drop_rule: str = "max"):
+             drop_rule: str = "max", protected_word_ids: set | None = None):
     """
-    drop_rule="max" (기본값): 기존 span 충돌 처리 파이프라인 그대로
-        (filter_by_L -> apply_threshold -> resolve_conflicts -> compute_final_drop_word_ids)
+    drop_rule="max" (기본값): threshold를 넘은 span을 큰 순서로 확정하고,
+        포함관계에 있는 자식 span을 강제 DROP한다.
     drop_rule="mean"/"min": 어절 단위로 직접 집계 (compute_word_scores 참고).
         이 경우 개별 span의 final_decision 개념이 없어 n_spans_dropped는
         "그 span 자신의 p_drop이 threshold를 넘었는지" 기준의 참고값으로 계산.
@@ -261,23 +269,28 @@ def compress(words, spans, L: int, threshold: float, use_dummy: bool = True, see
         spans = assign_dummy_probs(spans, seed=seed)
     spans = filter_by_L(spans, L)
 
+    spans_resolved = None
     if drop_rule == "max":
         spans_th = apply_threshold(spans, threshold)
         spans_resolved = resolve_conflicts(spans_th)
         drop_ids = compute_final_drop_word_ids(spans_resolved)
-        n_spans_dropped = sum(1 for s in spans_resolved if s["final_decision"] == "DROP")
+        n_spans_dropped = sum(
+            1 for s in spans_resolved if s["final_decision"] == "DROP"
+        )
     else:
         drop_ids = compute_final_drop_word_ids_by_rule(spans, threshold, mode=drop_rule)
         n_spans_dropped = sum(1 for s in spans if s["p_drop"] >= threshold)
 
-    result = compress_sentence(words, drop_ids)
+    result = compress_sentence(words, drop_ids, protected_word_ids=protected_word_ids)
     result["L"] = L
     result["threshold"] = threshold
     result["drop_rule"] = drop_rule
     result["n_spans_considered"] = len(spans)
     result["n_spans_dropped"] = n_spans_dropped
     result["n_forced_by_parent"] = (
-        sum(1 for s in spans_resolved if s.get("forced_by_parent")) if drop_rule == "max" else None
+        sum(1 for s in spans_resolved if s.get("forced_by_parent"))
+        if drop_rule == "max" and spans_resolved is not None
+        else None
     )
     return result
 
@@ -359,6 +372,23 @@ def self_test():
 
     drop_ids = compute_final_drop_word_ids(resolved)
     assert drop_ids == {1, 2}, f"[self_test 실패] 최종 DROP id 집합이 예상과 다름: {drop_ids}"
+    result = compress(
+        words,
+        [
+            {"size": 1, "word_ids": [1], "p_drop": 0.0},
+            {"size": 1, "word_ids": [2], "p_drop": 0.0},
+            {"size": 2, "word_ids": [1, 2], "p_drop": 0.9},
+        ],
+        L=2,
+        threshold=0.5,
+        use_dummy=False,
+    )
+    assert result["n_spans_dropped"] == 3, (
+        "[self_test 실패] resolve_conflicts 결과가 실제 삭제 경로에 반영되지 않음"
+    )
+    assert result["n_forced_by_parent"] == 2, (
+        "[self_test 실패] 자식 span 강제 DROP 수가 예상과 다름"
+    )
 
     return True
 

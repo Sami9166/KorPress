@@ -55,7 +55,11 @@ class IndexedJsonlDataset(Dataset):
 
 
 class SpanBatchCollator:
-    """Build a max-length context window that always contains the target utterance."""
+    """Build target-span windows with context-only surrounding utterances.
+
+    The surrounding words are encoded once per target window and influence the
+    target span representation, but they never receive a span label or loss.
+    """
 
     def __init__(self, tokenizer, chunk_words: dict[str, list[str]], max_length: int = 512):
         if not getattr(tokenizer, "is_fast", False):
@@ -85,20 +89,35 @@ class SpanBatchCollator:
         self._piece_count_cache[sentence_id] = counts
         return counts
 
-    def _window(self, record: dict[str, Any]) -> tuple[int, int]:
-        sentence_id = record["sentence_id"]
-        counts = self._piece_counts(sentence_id)
-        start = int(record["utterance_start"])
-        end = int(record["utterance_end"])
-        budget = self.max_length - self.tokenizer.num_special_tokens_to_add(pair=False)
-        used = sum(counts[start:end])
-        if used > budget:
-            raise ValueError(
-                f"Target utterance exceeds {budget} subwords: "
-                f"{record['utterance_uid']} ({used})"
-            )
+    @staticmethod
+    def _split_target_ranges(
+        counts: list[int], start: int, end: int, budget: int
+    ) -> list[tuple[int, int]]:
+        """Split an overlong target utterance at word boundaries."""
+        ranges: list[tuple[int, int]] = []
+        cursor = start
+        while cursor < end:
+            next_cursor = cursor
+            used = 0
+            while next_cursor < end and used + counts[next_cursor] <= budget:
+                used += counts[next_cursor]
+                next_cursor += 1
+            if next_cursor == cursor:
+                raise ValueError(
+                    "하나의 어절이 subword budget보다 길어 window로 나눌 수 없습니다: "
+                    f"word_index={cursor}, budget={budget}"
+                )
+            ranges.append((cursor, next_cursor))
+            cursor = next_cursor
+        return ranges
 
-        left, right = start - 1, end
+    @staticmethod
+    def _context_window(
+        counts: list[int], target_start: int, target_end: int, budget: int
+    ) -> tuple[int, int]:
+        """Add neighboring words while leaving the target range untouched."""
+        used = sum(counts[target_start:target_end])
+        left, right = target_start - 1, target_end
         take_left = True
         while left >= 0 or right < len(counts):
             candidates = (left, right) if take_left else (right, left)
@@ -119,27 +138,87 @@ class SpanBatchCollator:
                 break
         return left + 1, right
 
+    def _windows_for_record(
+        self, record: dict[str, Any]
+    ) -> list[tuple[int, int, dict[str, Any]]]:
+        sentence_id = record["sentence_id"]
+        counts = self._piece_counts(sentence_id)
+        start = int(record["utterance_start"])
+        end = int(record["utterance_end"])
+        budget = self.max_length - self.tokenizer.num_special_tokens_to_add(pair=False)
+        if not 0 <= start < end <= len(counts):
+            raise ValueError(f"잘못된 utterance 범위입니다: {(start, end)}")
+        if budget <= 0:
+            raise ValueError(f"max_length가 special token보다 작습니다: {self.max_length}")
+
+        target_ranges = self._split_target_ranges(counts, start, end, budget)
+        remaining = list(record["spans"])
+        windows: list[tuple[int, int, dict[str, Any]]] = []
+        for target_start, target_end in target_ranges:
+            selected = [
+                span
+                for span in remaining
+                if all(
+                    target_start <= int(index) < target_end
+                    for index in span["eojeol_indices"]
+                )
+            ]
+            if not selected:
+                continue
+            selected_ids = {str(span["span_id"]) for span in selected}
+            remaining = [
+                span for span in remaining if str(span["span_id"]) not in selected_ids
+            ]
+            begin, finish = self._context_window(
+                counts, target_start, target_end, budget
+            )
+            expanded = dict(record)
+            expanded["spans"] = selected
+            windows.append((begin, finish, expanded))
+
+        # A span crossing a split boundary gets a dedicated target window. This
+        # keeps every span intact and emits each span_id exactly once.
+        for span in remaining:
+            indices = [int(index) for index in span["eojeol_indices"]]
+            span_start, span_end = min(indices), max(indices) + 1
+            span_subwords = sum(counts[span_start:span_end])
+            if span_subwords > budget:
+                raise ValueError(
+                    f"span이 subword budget보다 깁니다: {span['span_id']} "
+                    f"({span_subwords} > {budget})"
+                )
+            begin, finish = self._context_window(
+                counts, span_start, span_end, budget
+            )
+            expanded = dict(record)
+            expanded["spans"] = [span]
+            windows.append((begin, finish, expanded))
+        return windows
+
     def __call__(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         windows: list[list[str]] = []
         bounds: list[tuple[int, int]] = []
+        expanded_records: list[dict[str, Any]] = []
         for record in records:
-            begin, end = self._window(record)
-            bounds.append((begin, end))
-            windows.append(self.chunk_words[record["sentence_id"]][begin:end])
+            for begin, end, expanded in self._windows_for_record(record):
+                bounds.append((begin, end))
+                windows.append(self.chunk_words[record["sentence_id"]][begin:end])
+                expanded_records.append(expanded)
 
         encoded = self.tokenizer(
             windows,
             is_split_into_words=True,
             padding=True,
             truncation=False,
-            max_length=self.max_length,
             return_tensors="pt",
         )
 
         all_masks: list[torch.Tensor] = []
         labels: list[int] = []
         span_ids: list[str] = []
-        for batch_index, (record, (begin, _)) in enumerate(zip(records, bounds)):
+        for batch_index, (record, (begin, _)) in enumerate(
+            zip(expanded_records, bounds)
+        ):
             word_ids = encoded.word_ids(batch_index=batch_index)
             masks = torch.zeros((len(record["spans"]), len(word_ids)), dtype=torch.bool)
             for span_index, span in enumerate(record["spans"]):
@@ -159,7 +238,7 @@ class SpanBatchCollator:
             "span_token_masks": all_masks,
             "labels": torch.tensor(labels, dtype=torch.long),
             "span_ids": span_ids,
-            "records": records,
+            "records": expanded_records,
             "window_bounds": bounds,
         }
 

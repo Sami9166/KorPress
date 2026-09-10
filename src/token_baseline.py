@@ -214,13 +214,44 @@ def _piece_counts(tokenizer: Any, words: Sequence[str]) -> List[int]:
     return counts
 
 
+def _split_target_ranges(
+    offsets: Sequence[int], start: int, end: int, budget: int
+) -> List[Tuple[int, int]]:
+    """Split an overlong target into contiguous word ranges without truncation.
+
+    The ranges partition the target utterance, so every subword receives one
+    score.  Neighboring words are added later as context only.
+    """
+    ranges: List[Tuple[int, int]] = []
+    cursor = start
+    while cursor < end:
+        next_cursor = cursor
+        while next_cursor < end:
+            next_used = offsets[next_cursor + 1] - offsets[cursor]
+            if next_used > budget:
+                break
+            next_cursor += 1
+        if next_cursor == cursor:
+            raise ValueError(
+                "하나의 어절이 subword budget보다 길어 window로 나눌 수 없습니다: "
+                f"word_index={cursor}, budget={budget}"
+            )
+        ranges.append((cursor, next_cursor))
+        cursor = next_cursor
+    return ranges
+
+
 def _utterance_windows(
     tokenizer: Any,
     words: Sequence[str],
     utterance_bounds: Sequence[Tuple[int, int]],
     max_length: int,
-) -> List[Tuple[int, int, int, int]]:
-    """Build the same target-utterance-centered windows as SpanBatchCollator."""
+) -> List[Tuple[int, int, int, int, int, int, int, int]]:
+    """Build target windows with context-only neighboring words.
+
+    Long utterances are split at word boundaries.  The target ranges do not
+    overlap; only their surrounding context may be repeated.
+    """
     counts = _piece_counts(tokenizer, words)
     budget = max_length - tokenizer.num_special_tokens_to_add(pair=False)
     if budget <= 0:
@@ -229,38 +260,51 @@ def _utterance_windows(
     for count in counts:
         offsets.append(offsets[-1] + count)
 
-    windows: List[Tuple[int, int, int, int]] = []
-    for start, end in utterance_bounds:
-        if not 0 <= start < end <= len(words):
-            raise ValueError(f"잘못된 utterance 범위입니다: {(start, end)}")
-        used = offsets[end] - offsets[start]
-        if used > budget:
+    windows: List[Tuple[int, int, int, int, int, int, int, int]] = []
+    for utterance_start, utterance_end in utterance_bounds:
+        if not 0 <= utterance_start < utterance_end <= len(words):
             raise ValueError(
-                f"Target utterance exceeds {budget} subwords: {(start, end)} ({used})"
+                f"잘못된 utterance 범위입니다: {(utterance_start, utterance_end)}"
             )
-        left, right = start - 1, end
-        take_left = True
-        while left >= 0 or right < len(words):
-            candidates = (left, right) if take_left else (right, left)
-            added = False
-            for position in candidates:
-                if position < 0 or position >= len(words):
-                    continue
-                candidate_start = offsets[position]
-                candidate_end = offsets[position + 1]
-                if used + candidate_end - candidate_start <= budget:
-                    used += candidate_end - candidate_start
-                    if position == left:
-                        left -= 1
-                    else:
-                        right += 1
-                    added = True
-                    take_left = not take_left
+        target_ranges = _split_target_ranges(
+            offsets, utterance_start, utterance_end, budget
+        )
+        for start, end in target_ranges:
+            used = offsets[end] - offsets[start]
+            left, right = start - 1, end
+            take_left = True
+            while left >= 0 or right < len(words):
+                candidates = (left, right) if take_left else (right, left)
+                added = False
+                for position in candidates:
+                    if position < 0 or position >= len(words):
+                        continue
+                    candidate_start = offsets[position]
+                    candidate_end = offsets[position + 1]
+                    if used + candidate_end - candidate_start <= budget:
+                        used += candidate_end - candidate_start
+                        if position == left:
+                            left -= 1
+                        else:
+                            right += 1
+                        added = True
+                        take_left = not take_left
+                        break
+                if not added:
                     break
-            if not added:
-                break
-        begin, finish = left + 1, right
-        windows.append((begin, finish, offsets[begin], offsets[finish]))
+            begin, finish = left + 1, right
+            windows.append(
+                (
+                    begin,
+                    finish,
+                    offsets[begin],
+                    offsets[finish],
+                    start,
+                    end,
+                    offsets[start],
+                    offsets[end],
+                )
+            )
     return windows
 
 
@@ -382,28 +426,67 @@ def load_token_examples(
 
 
 class TokenClassificationDataset:
-    """Utterance-windowed dataset for word or precomputed subword labels."""
+    """Utterance-windowed dataset with context-only surrounding words.
+
+    A window contains neighboring utterances so the encoder can use context,
+    but only the target utterance receives a loss.  This mirrors the Span
+    collator, which pools and supervises target spans while treating the rest
+    of the window as context.
+    """
 
     def __init__(self, examples: Sequence[TokenExample], tokenizer: Any, max_length: int):
         self.examples = list(examples)
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.windows: List[Tuple[TokenExample, int, int, int, int]] = []
+        self.windows: List[
+            Tuple[TokenExample, int, int, int, int, int, int, int, int]
+        ] = []
         for example in self.examples:
             bounds = example.utterance_bounds or ((0, len(example.words)),)
-            for begin, end, subword_begin, subword_end in _utterance_windows(
+            for (
+                begin,
+                end,
+                subword_begin,
+                subword_end,
+                target_begin,
+                target_end,
+                target_subword_begin,
+                target_subword_end,
+            ) in _utterance_windows(
                 tokenizer,
                 example.words,
                 bounds,
                 max_length,
             ):
-                self.windows.append((example, begin, end, subword_begin, subword_end))
+                self.windows.append(
+                    (
+                        example,
+                        begin,
+                        end,
+                        subword_begin,
+                        subword_end,
+                        target_begin,
+                        target_end,
+                        target_subword_begin,
+                        target_subword_end,
+                    )
+                )
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        example, begin, end, subword_begin, subword_end = self.windows[index]
+        (
+            example,
+            begin,
+            end,
+            subword_begin,
+            subword_end,
+            target_begin,
+            target_end,
+            target_subword_begin,
+            target_subword_end,
+        ) = self.windows[index]
         encoding = self.tokenizer(
             list(example.words[begin:end]),
             is_split_into_words=True,
@@ -411,26 +494,29 @@ class TokenClassificationDataset:
         )
         word_ids = encoding.word_ids()
         if example.subword_labels is None:
-            word_labels = example.labels[begin:end]
             encoding["labels"] = [
                 -100
-                if word_id is None or word_id >= len(word_labels)
-                else word_labels[word_id]
+                if word_id is None
+                or not target_begin <= begin + word_id < target_end
+                else example.labels[begin + word_id]
                 for word_id in word_ids
             ]
         else:
-            subword_labels = example.subword_labels[subword_begin:subword_end]
             labels = []
             subword_index = 0
             for word_id in word_ids:
                 if word_id is None:
                     labels.append(-100)
                     continue
-                if subword_index >= len(subword_labels):
+                global_subword_index = subword_begin + subword_index
+                if global_subword_index >= subword_end:
                     raise ValueError(
                         f"tokenizer subword 수가 label보다 많습니다: {example.sentence_id}"
                     )
-                labels.append(subword_labels[subword_index])
+                if target_subword_begin <= global_subword_index < target_subword_end:
+                    labels.append(example.subword_labels[global_subword_index])
+                else:
+                    labels.append(-100)
                 subword_index += 1
             encoding["labels"] = labels
         return encoding
@@ -499,7 +585,12 @@ class TokenBaselineCompressor:
         words: Sequence[str],
         utterance_bounds: Sequence[Tuple[int, int]] | None = None,
     ) -> Tuple[List[float], List[int], List[int], List[str]]:
-        """Score every subword through Span-style utterance-centered windows."""
+        """Score each subword once using its target utterance window.
+
+        Neighboring utterances are passed to the encoder as context, but their
+        predictions are discarded.  The target ranges partition the chunk, so
+        no overlapping-window probability averaging is needed (or allowed).
+        """
         full_encoding = self.tokenizer(
             list(words),
             is_split_into_words=True,
@@ -513,19 +604,36 @@ class TokenBaselineCompressor:
         windows = _utterance_windows(self.tokenizer, words, bounds, self.max_length)
         score_sums = [0.0] * len(full_ids)
         score_counts = [0] * len(full_ids)
-        for begin, end, subword_begin, subword_end in windows:
+        for (
+            begin,
+            end,
+            subword_begin,
+            subword_end,
+            _target_begin,
+            _target_end,
+            target_subword_begin,
+            target_subword_end,
+        ) in windows:
             local_scores, local_ids = self._score_window(words[begin:end])
             expected_ids = full_ids[subword_begin:subword_end]
             if local_ids != expected_ids:
                 raise ValueError("학습 tokenizer와 추론 tokenizer의 subword 정렬이 다릅니다.")
-            for offset, score in enumerate(local_scores):
+            local_target_begin = target_subword_begin - subword_begin
+            local_target_end = target_subword_end - subword_begin
+            for offset, score in enumerate(
+                local_scores[local_target_begin:local_target_end],
+                start=local_target_begin,
+            ):
                 global_index = subword_begin + offset
                 score_sums[global_index] += score
                 score_counts[global_index] += 1
         missing = [index for index, count in enumerate(score_counts) if count == 0]
+        duplicate = [index for index, count in enumerate(score_counts) if count > 1]
         if missing:
-            raise ValueError(f"window에서 점수를 얻지 못한 subword가 있습니다: {missing[0]}")
-        scores = [total / count for total, count in zip(score_sums, score_counts)]
+            raise ValueError(f"target window에서 점수를 얻지 못한 subword가 있습니다: {missing[0]}")
+        if duplicate:
+            raise ValueError(f"subword가 여러 target window에서 점수화되었습니다: {duplicate[0]}")
+        scores = score_sums
         truncated: List[int] = []
         token_texts = self.tokenizer.convert_ids_to_tokens(full_ids)
         return scores, full_ids, truncated, token_texts

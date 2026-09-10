@@ -6,8 +6,12 @@ the old ``qa_eval``/``qa_results`` files.  Qwen3-8B is the default reader and
 tokenizer. It compresses every candidate context, calibrates actual deletion
 rate with the Qwen tokenizer, and by default runs the reader only for the
 nearest settings at each target deletion rate. Use ``--all-settings`` only
-for an exhaustive diagnostic run. Both question-level and aggregate metrics
-are written for the evaluated settings.
+for an exhaustive diagnostic run. Question-level predictions,
+compression/survival statistics, and reader latency are written for the
+evaluated settings. Official KorQuAD EM/F1 is intentionally not
+reimplemented here; prediction JSON files are emitted for the official
+evaluator. By default the run uses a deterministic 1,000-question subset;
+pass ``--max-questions 0`` to evaluate every supplied question.
 
 The context used for compression is ``chunks.csv``.  That file is the source
 whose eojeol indices the dependency-span records refer to; the context string
@@ -59,9 +63,6 @@ except ImportError:
     )
 
 
-PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
-
-
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
@@ -78,6 +79,26 @@ def _first_answer(qa: Mapping[str, Any]) -> str:
         if isinstance(first, Mapping):
             return str(first.get("text", ""))
     return ""
+
+
+def _all_answers(qa: Mapping[str, Any]) -> List[str]:
+    """Return every reference answer without changing compact input shape."""
+    answers = qa.get("answers")
+    if isinstance(answers, list):
+        values: List[str] = []
+        for answer in answers:
+            if isinstance(answer, str):
+                text = answer
+            elif isinstance(answer, Mapping):
+                text = str(answer.get("text", ""))
+            else:
+                text = ""
+            if text:
+                values.append(text)
+        if values:
+            return values
+    first = _first_answer(qa)
+    return [first] if first else []
 
 
 def load_qa_passages(path: Path) -> List[Dict[str, Any]]:
@@ -99,7 +120,7 @@ def load_qa_passages(path: Path) -> List[Dict[str, Any]]:
         raw_qas = passage.get("qas", [])
         if not isinstance(raw_qas, list):
             raise ValueError(f"qas는 배열이어야 합니다: {passage_id}")
-        qas: List[Dict[str, str]] = []
+        qas: List[Dict[str, Any]] = []
         for index, raw_qa in enumerate(raw_qas):
             if not isinstance(raw_qa, Mapping):
                 raise ValueError(f"QA 항목 형식이 잘못되었습니다: {passage_id}:{index}")
@@ -111,6 +132,7 @@ def load_qa_passages(path: Path) -> List[Dict[str, Any]]:
                     "question_id": str(raw_qa.get("id", f"{passage_id}_q{index}")),
                     "question": question,
                     "answer": _first_answer(raw_qa),
+                    "answers": _all_answers(raw_qa),
                 }
             )
         passages.append(
@@ -125,45 +147,55 @@ def load_qa_passages(path: Path) -> List[Dict[str, Any]]:
     return passages
 
 
-def normalize_answer(text: str) -> str:
-    """Korean-friendly SQuAD normalization for EM/F1."""
+def limit_qa_passages(
+    passages: Sequence[Mapping[str, Any]], max_questions: int
+) -> List[Dict[str, Any]]:
+    """Keep a deterministic prefix of questions without splitting passage IDs.
+
+    A passage can contain multiple questions.  The last selected passage may
+    therefore contain only a prefix of its questions; all selected question
+    IDs remain stable across reruns and can be used to build a matching gold
+    subset for the official evaluator.
+    """
+    if max_questions < 0:
+        raise ValueError("--max-questions는 0 이상이어야 합니다.")
+    if max_questions == 0:
+        return [dict(passage) for passage in passages]
+
+    selected: List[Dict[str, Any]] = []
+    remaining = max_questions
+    for passage in passages:
+        if remaining <= 0:
+            break
+        qas = list(passage["qas"])
+        if not qas:
+            continue
+        selected_passage = dict(passage)
+        selected_passage["qas"] = qas[:remaining]
+        selected.append(selected_passage)
+        remaining -= len(selected_passage["qas"])
+    return selected
+
+
+def question_ids(passages: Sequence[Mapping[str, Any]]) -> List[str]:
+    return [
+        str(qa["question_id"])
+        for passage in passages
+        for qa in passage["qas"]
+    ]
+
+
+def _normalize_for_survival(text: str) -> str:
+    """Normalize only enough to check literal answer survival in context."""
     normalized = unicodedata.normalize("NFKC", str(text)).lower()
-    normalized = PUNCTUATION_RE.sub(" ", normalized)
     return " ".join(normalized.split())
 
 
-def exact_match(prediction: str, gold: str) -> bool:
-    return normalize_answer(prediction) == normalize_answer(gold)
-
-
-def token_f1(prediction: str, gold: str) -> float:
-    predicted = normalize_answer(prediction).split()
-    reference = normalize_answer(gold).split()
-    if not predicted and not reference:
-        return 1.0
-    if not predicted or not reference:
-        return 0.0
-    counts: Dict[str, int] = {}
-    for token in predicted:
-        counts[token] = counts.get(token, 0) + 1
-    overlap = 0
-    remaining = dict(counts)
-    for token in reference:
-        if remaining.get(token, 0) > 0:
-            overlap += 1
-            remaining[token] -= 1
-    if overlap == 0:
-        return 0.0
-    precision = overlap / len(predicted)
-    recall = overlap / len(reference)
-    return 2 * precision * recall / (precision + recall)
-
-
 def answer_survives(answer: str, compressed_context: str) -> bool:
-    normalized_answer = normalize_answer(answer)
+    normalized_answer = _normalize_for_survival(answer)
     if not normalized_answer:
         return False
-    return normalized_answer in normalize_answer(compressed_context)
+    return normalized_answer in _normalize_for_survival(compressed_context)
 
 
 def _prompt_text(context: str, question: str) -> str:
@@ -172,14 +204,14 @@ def _prompt_text(context: str, question: str) -> str:
     The GPT teacher prompt used to create ``span_labels.csv.gz`` is deliberately
     not reused here: it is a data-generation instruction, whereas this prompt
     is the downstream reader instruction applied to original and compressed
-    contexts alike.  The explicit Korean-output instruction keeps EM/F1
-    evaluation language-stable.
+    contexts alike. The explicit Korean-output instruction is shared across
+    every method.
     """
     return (
-        "Read the following text and answer briefly.\n\n"
+        "Read the following text.\n\n"
         f"{context}\n\n"
         "Now, answer the following question based on the above text. "
-        "Only give me the answer and do not output any other words. "
+        "Only output the answer and do not output any other words. "
         "Answer in Korean.\n\n"
         f"Question: {question}\n"
         "Answer:"
@@ -333,6 +365,40 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
+
+
+def _official_prediction_map(
+    rows: Sequence[Mapping[str, Any]], field: str
+) -> Dict[str, str]:
+    """Build the ``question_id -> prediction`` JSON expected by KorQuAD."""
+    predictions: Dict[str, str] = {}
+    for row in rows:
+        question_id = str(row["question_id"])
+        if question_id in predictions:
+            raise ValueError(
+                "공식 KorQuAD prediction key가 중복되었습니다: "
+                f"{question_id}"
+            )
+        predictions[question_id] = str(row[field])
+    return predictions
+
+
+def _official_original_prediction_map(
+    passages: Sequence[Mapping[str, Any]],
+    predictions: Mapping[Tuple[str, str], str],
+) -> Dict[str, str]:
+    rows: List[Dict[str, str]] = []
+    for passage in passages:
+        passage_id = str(passage["passage_id"])
+        for qa in passage["qas"]:
+            question_id = str(qa["question_id"])
+            rows.append(
+                {
+                    "question_id": question_id,
+                    "prediction": str(predictions[(passage_id, question_id)]),
+                }
+            )
+    return _official_prediction_map(rows, "prediction")
 
 
 def _release_model_memory() -> None:
@@ -573,6 +639,7 @@ def _evaluate_setting(
             question_id = str(qa["question_id"])
             question = str(qa["question"])
             answer = str(qa["answer"])
+            answers = [str(value) for value in qa.get("answers", [answer])]
             key = (passage_id, question_id)
             if key not in original_predictions:
                 raise KeyError(f"원문 QA 예측 캐시가 없습니다: {key}")
@@ -589,11 +656,7 @@ def _evaluate_setting(
                 max_new_tokens,
             )
             compressed_latencies.append(compressed_latency)
-            survives = answer_survives(answer, compressed)
-            em_original = exact_match(pred_original, answer)
-            em_compressed = exact_match(pred_compressed, answer)
-            f1_original = token_f1(pred_original, answer)
-            f1_compressed = token_f1(pred_compressed, answer)
+            survives = any(answer_survives(value, compressed) for value in answers)
             answer_survival_count += int(survives)
             question_count += 1
             output_qas.append(
@@ -601,6 +664,7 @@ def _evaluate_setting(
                     "question_id": question_id,
                     "question": question,
                     "answer": answer,
+                    "answers": answers,
                     "answer_survives_compression": survives,
                 }
             )
@@ -610,17 +674,12 @@ def _evaluate_setting(
                     "question_id": question_id,
                     "question": question,
                     "gold": answer,
+                    "gold_answers": answers,
                     "pred_original": pred_original,
                     "pred_compressed": pred_compressed,
                     "reader_latency_s_original": original_latencies[key],
                     "reader_latency_s_compressed": compressed_latency,
                     "answer_survives_compression": survives,
-                    "em_original": em_original,
-                    "em_compressed": em_compressed,
-                    "em_delta": int(em_compressed) - int(em_original),
-                    "f1_original": f1_original,
-                    "f1_compressed": f1_compressed,
-                    "f1_delta": f1_compressed - f1_original,
                 }
             )
         eval_passages.append(
@@ -657,29 +716,7 @@ def _evaluate_setting(
             not str(row["pred_compressed"]).strip() for row in question_rows
         )
         / len(question_rows),
-        "em_original": sum(bool(row["em_original"]) for row in question_rows)
-        / len(question_rows),
-        "em_compressed": sum(bool(row["em_compressed"]) for row in question_rows)
-        / len(question_rows),
-        "f1_original": sum(float(row["f1_original"]) for row in question_rows)
-        / len(question_rows),
-        "f1_compressed": sum(float(row["f1_compressed"]) for row in question_rows)
-        / len(question_rows),
     }
-    summary["em_delta"] = summary["em_compressed"] - summary["em_original"]
-    summary["f1_delta"] = summary["f1_compressed"] - summary["f1_original"]
-    summary["em_loss"] = summary["em_original"] - summary["em_compressed"]
-    summary["f1_loss"] = summary["f1_original"] - summary["f1_compressed"]
-    summary["em_relative_loss"] = (
-        summary["em_loss"] / summary["em_original"]
-        if summary["em_original"]
-        else None
-    )
-    summary["f1_relative_loss"] = (
-        summary["f1_loss"] / summary["f1_original"]
-        if summary["f1_original"]
-        else None
-    )
     summary.update(_latency_stats(compressed_latencies))
     original_latency_stats = _latency_stats(
         [original_latencies[(str(passage["passage_id"]), str(qa["question_id"]))]
@@ -707,8 +744,6 @@ def _original_summary(
     qwen_model: str,
 ) -> Dict[str, Any]:
     """Build the no-compression QA baseline for the same test passages."""
-    em_values: List[float] = []
-    f1_values: List[float] = []
     survival_values: List[float] = []
     latency_values: List[float] = []
     empty_predictions = 0
@@ -720,16 +755,15 @@ def _original_summary(
             prediction = predictions[key]
             latency_values.append(float(latencies[key]))
             answer = str(qa["answer"])
-            em_values.append(float(exact_match(prediction, answer)))
-            f1_values.append(token_f1(prediction, answer))
-            survival_values.append(float(answer_survives(answer, context)))
+            answers = [str(value) for value in qa.get("answers", [answer])]
+            survival_values.append(
+                float(any(answer_survives(value, context) for value in answers))
+            )
             empty_predictions += int(not prediction.strip())
 
-    n_questions = len(em_values)
+    n_questions = len(survival_values)
     if not n_questions:
         raise ValueError("원문 QA baseline을 계산할 질문이 없습니다.")
-    em = sum(em_values) / n_questions
-    f1 = sum(f1_values) / n_questions
     summary = {
         "method": "Original",
         "setting": "Original",
@@ -740,16 +774,6 @@ def _original_summary(
         "answer_survival_rate": sum(survival_values) / n_questions,
         "empty_compressed_context_rate": 0.0,
         "empty_prediction_rate": empty_predictions / n_questions,
-        "em_original": em,
-        "em_compressed": em,
-        "em_delta": 0.0,
-        "f1_original": f1,
-        "f1_compressed": f1,
-        "f1_delta": 0.0,
-        "em_loss": 0.0,
-        "f1_loss": 0.0,
-        "em_relative_loss": 0.0,
-        "f1_relative_loss": 0.0,
         "L": "",
         "threshold": "",
         "drop_rule": "",
@@ -850,14 +874,6 @@ def _matched_qa(
         }
         for metric in (
             "answer_survival_rate",
-            "em_compressed",
-            "f1_compressed",
-            "em_delta",
-            "f1_delta",
-            "em_loss",
-            "f1_loss",
-            "em_relative_loss",
-            "f1_relative_loss",
             "empty_prediction_rate",
             "reader_latency_mean_s",
             "reader_latency_median_s",
@@ -903,7 +919,18 @@ def main() -> None:
         default="auto",
     )
     parser.add_argument("--max-input-tokens", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=1000,
+        help="평가할 질문 수. 입력 순서의 고정 prefix를 사용하며 0이면 전체 질문입니다.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=128,
+        help="Reader answer budget; the same value is used for original/compressed contexts.",
+    )
     parser.add_argument(
         "--token-checkpoint",
         required=True,
@@ -954,13 +981,12 @@ def main() -> None:
         action="store_true",
         help="target별 CR에 가까운 설정만 고르지 않고 모든 조합을 QA 평가합니다.",
     )
-    parser.add_argument("--max-samples", type=int, help="개발용 passage 상한. 본 실험에서는 생략하세요.")
     args = parser.parse_args()
 
     chunks = load_chunks(args.chunks)
-    passages = load_qa_passages(args.qa_pairs)
-    if args.max_samples is not None:
-        passages = passages[: args.max_samples]
+    passages = limit_qa_passages(load_qa_passages(args.qa_pairs), args.max_questions)
+    if not passages or not question_ids(passages):
+        raise ValueError("평가할 QA 질문이 없습니다.")
     passage_ids = [str(passage["passage_id"]) for passage in passages]
     missing = [passage_id for passage_id in passage_ids if passage_id not in chunks]
     if missing:
@@ -1091,6 +1117,14 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        output_dir / "qa_question_ids.json",
+        {
+            "max_questions": args.max_questions,
+            "n_questions": len(question_ids(passages)),
+            "question_ids": question_ids(passages),
+        },
+    )
     if args.all_settings:
         selected_jobs = list(evaluation_jobs)
         selection_rows = _all_job_selection_rows(evaluation_jobs, token_counter)
@@ -1183,6 +1217,10 @@ def main() -> None:
             output_dir / f"qa_results_{setting}.json",
             {"per_question": question_rows, "summary": summary},
         )
+        _write_json(
+            output_dir / f"qa_predictions_{setting}.json",
+            _official_prediction_map(question_rows, "pred_compressed"),
+        )
         summaries.append(summary)
 
     for setting, method, rows, metadata in selected_jobs:
@@ -1206,6 +1244,10 @@ def main() -> None:
             f"{passage_id}::{question_id}": prediction
             for (passage_id, question_id), prediction in original_predictions.items()
         },
+    )
+    _write_json(
+        output_dir / "qa_predictions_original.json",
+        _official_original_prediction_map(passages, original_predictions),
     )
     _write_json(
         output_dir / "qa_original_latency.json",
