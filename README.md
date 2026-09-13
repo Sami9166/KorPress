@@ -89,11 +89,9 @@ target/actual/gap을 모두 기록합니다. Span의 `L`과 `drop_rule`은 구�
 1,000문항 subset을 사용하고, `--max-questions 0`이면 입력된 전체 질문을 사용합니다.
 공식 KorQuAD EM/F1은 이 스크립트에서 임의로 재구현하지 않으며, 각 설정의
 `qa_predictions_*.json`과 원문용 `qa_predictions_original.json`을 공식 evaluator에
-입력해 계산합니다. 질문별 reader latency는 `qa_results_*.json`의
-`end_to_end_latency_s`(호환용 필드)에, 집계값(mean/median/p95/total)은
-`qa_summary.csv`에 저장됩니다. Span prediction은 파일에서 읽고 Token score는
-보조 encoder로 계산하므로, 공정한 주 비교를 위해 latency에는 Qwen reader 생성만
-포함하고 설정별 일회성 압축 시간은 `compression_wall_time_s`로 별도 기록합니다.
+입력해 계산합니다. `qa_summary.csv`에는 retention rate, 압축률, answer survival만
+기록합니다. Latency는 dependency parsing이 학습/전처리 단계에만 해당하고
+Span prediction과 Token scoring 경로도 달라 주 비교 지표에서 제외했습니다.
 모델을 바꾸려면 `--qwen-model` 하나만 지정합니다(`--qwen-tokenizer`, `--qa-model`은
 호환용 별칭).
 
@@ -112,7 +110,7 @@ python evaluate-korquad_2.0.py path/to/KorQuAD_v2.1_dev.json experiments/qa_qwen
 ```
 
 이 명령은 원문/압축 prediction 파일 각각에 대해 공식 EM/F1을 계산합니다. 저장소의
-`qa_summary.csv`에는 공식 점수 대신 압축률, answer survival, latency만 남깁니다.
+`qa_summary.csv`에는 공식 점수 대신 압축률, retention rate, answer survival만 남깁니다.
 1,000문항 실행의 질문 목록은 `question_ids.json`과 QA 결과의 `qa_question_ids.json`에
 저장되므로, 공식 evaluator를
 사용할 때는 동일한 question ID만 포함한 gold subset을 함께 사용해야 합니다.

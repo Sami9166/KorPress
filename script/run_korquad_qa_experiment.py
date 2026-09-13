@@ -1,12 +1,12 @@
-"""Run a fixed-retention end-to-end KorQuAD evaluation for Span and Token.
+"""Run a fixed-retention KorQuAD QA evaluation for Span and Token.
 
 This entry point deliberately starts from the raw KorQuAD question file and
 the current encoder probabilities. It does not merge, reuse, or post-process
 the old ``qa_eval``/``qa_results`` files. Qwen3-8B is the default reader and
 tokenizer. Both compressors receive the same retention-rate targets and keep
 their native deletion units while targeting the resulting reader-token budget.
-Question-level predictions, compression/survival statistics, and latency are
-written for every requested setting. Official KorQuAD EM/F1 is intentionally
+Question-level predictions and compression/survival statistics are written
+for every requested setting. Official KorQuAD EM/F1 is intentionally
 not reimplemented here; prediction JSON files are emitted for the official
 evaluator. By default the run uses a deterministic 1,000-question subset;
 pass ``--max-questions 0`` to evaluate every supplied question.
@@ -21,9 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
-import time
 import sys
 import unicodedata
 from pathlib import Path
@@ -305,69 +303,6 @@ def generate_answer(
     return re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
 
 
-def _synchronize_device(device: Any) -> None:
-    """Synchronize CUDA before/after timing asynchronous generation kernels."""
-    try:
-        import torch
-    except ImportError:
-        return
-    device_type = getattr(device, "type", str(device))
-    if device_type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize(device)
-
-
-def generate_answer_timed(
-    model: Any,
-    tokenizer: Any,
-    device: Any,
-    context: str,
-    question: str,
-    max_input_tokens: int,
-    max_new_tokens: int,
-) -> Tuple[str, float]:
-    """Generate one answer and return its timed generation duration."""
-    _synchronize_device(device)
-    started = time.perf_counter()
-    answer = generate_answer(
-        model,
-        tokenizer,
-        device,
-        context,
-        question,
-        max_input_tokens,
-        max_new_tokens,
-    )
-    _synchronize_device(device)
-    return answer, time.perf_counter() - started
-
-
-def _end_to_end_latency_stats(values: Sequence[float]) -> Dict[str, float]:
-    """Summarize the measured per-question reader-generation latency."""
-    if not values:
-        raise ValueError("latency 값이 없습니다.")
-    ordered = sorted(float(value) for value in values)
-    p95_index = min(len(ordered) - 1, max(0, math.ceil(0.95 * len(ordered)) - 1))
-    return {
-        "end_to_end_latency_total_s": sum(ordered),
-        "end_to_end_latency_mean_s": sum(ordered) / len(ordered),
-        "end_to_end_latency_median_s": ordered[len(ordered) // 2]
-        if len(ordered) % 2
-        else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2,
-        "end_to_end_latency_p95_s": ordered[p95_index],
-    }
-
-
-def _timed_compression(function, *args, device: Any = None, **kwargs):
-    """Run compression once and return rows plus elapsed wall-clock seconds."""
-    if device is not None:
-        _synchronize_device(device)
-    started = time.perf_counter()
-    rows = function(*args, **kwargs)
-    if device is not None:
-        _synchronize_device(device)
-    return rows, time.perf_counter() - started
-
-
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -482,14 +417,12 @@ def _evaluate_setting(
     passages: Sequence[Mapping[str, Any]],
     chunks: Mapping[str, str],
     original_predictions: Mapping[Tuple[str, str], str],
-    original_latencies: Mapping[Tuple[str, str], float],
     model: Any,
     tokenizer: Any,
     device: Any,
     token_counter: TokenCounter,
     max_input_tokens: int,
     max_new_tokens: int,
-    compression_elapsed_s: float,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     compressed_by_id = {
         str(row["sentence_id"]): row for row in compressed_rows
@@ -501,7 +434,6 @@ def _evaluate_setting(
     compressed_empty = 0
     answer_survival_count = 0
     question_count = 0
-    generation_durations: List[float] = []
 
     for passage in passages:
         passage_id = str(passage["passage_id"])
@@ -527,10 +459,8 @@ def _evaluate_setting(
             key = (passage_id, question_id)
             if key not in original_predictions:
                 raise KeyError(f"원문 QA 예측 캐시가 없습니다: {key}")
-            if key not in original_latencies:
-                raise KeyError(f"원문 QA timing 캐시가 없습니다: {key}")
             pred_original = original_predictions[key]
-            pred_compressed, generation_duration = generate_answer_timed(
+            pred_compressed = generate_answer(
                 model,
                 tokenizer,
                 device,
@@ -539,7 +469,6 @@ def _evaluate_setting(
                 max_input_tokens,
                 max_new_tokens,
             )
-            generation_durations.append(generation_duration)
             survives = any(answer_survives(value, compressed) for value in answers)
             answer_survival_count += int(survives)
             question_count += 1
@@ -583,14 +512,6 @@ def _evaluate_setting(
 
     if not question_rows:
         raise ValueError(f"QA 항목이 없습니다: {setting}")
-    # Span predictions are loaded from disk while Token scores are produced by
-    # the auxiliary encoder here. Keep the primary latency metric to reader
-    # generation so the two methods have the same measured scope; report the
-    # one-time compression wall time separately for transparency.
-    reader_latencies = generation_durations
-    for row, latency in zip(question_rows, reader_latencies):
-        row["reader_latency_s"] = latency
-        row["end_to_end_latency_s"] = latency
     summary: Dict[str, Any] = {
         "method": method,
         "setting": setting,
@@ -608,27 +529,7 @@ def _evaluate_setting(
             not str(row["pred_compressed"]).strip() for row in question_rows
         )
         / len(question_rows),
-        "compression_wall_time_s": max(0.0, float(compression_elapsed_s)),
-        "latency_scope": "reader_generation_only",
     }
-    summary.update(_end_to_end_latency_stats(reader_latencies))
-    original_timing_stats = _end_to_end_latency_stats(
-        [original_latencies[(str(passage["passage_id"]), str(qa["question_id"]))]
-         for passage in passages
-         for qa in passage["qas"]]
-    )
-    for key, value in original_timing_stats.items():
-        summary[f"original_{key}"] = value
-    summary["end_to_end_latency_mean_ratio_vs_original"] = (
-        summary["end_to_end_latency_mean_s"]
-        / original_timing_stats["end_to_end_latency_mean_s"]
-        if original_timing_stats["end_to_end_latency_mean_s"]
-        else None
-    )
-    summary["end_to_end_latency_mean_delta_s_vs_original"] = (
-        summary["end_to_end_latency_mean_s"]
-        - original_timing_stats["end_to_end_latency_mean_s"]
-    )
     return eval_passages, question_rows, summary
 
 
@@ -636,12 +537,10 @@ def _original_summary(
     passages: Sequence[Mapping[str, Any]],
     chunks: Mapping[str, str],
     predictions: Mapping[Tuple[str, str], str],
-    latencies: Mapping[Tuple[str, str], float],
     qwen_model: str,
 ) -> Dict[str, Any]:
     """Build the no-compression QA baseline for the same test passages."""
     survival_values: List[float] = []
-    latency_values: List[float] = []
     empty_predictions = 0
     for passage in passages:
         passage_id = str(passage["passage_id"])
@@ -649,7 +548,6 @@ def _original_summary(
         for qa in passage["qas"]:
             key = (passage_id, str(qa["question_id"]))
             prediction = predictions[key]
-            latency_values.append(float(latencies[key]))
             answer = str(qa["answer"])
             answers = [str(value) for value in qa.get("answers", [answer])]
             survival_values.append(
@@ -675,22 +573,8 @@ def _original_summary(
         "threshold": "",
         "drop_rule": "",
         "retention_rate": "",
-        "compression_wall_time_s": 0.0,
-        "latency_scope": "reader_generation_only",
         "qwen_model": qwen_model,
     }
-    summary.update(_end_to_end_latency_stats(latency_values))
-    for key in (
-        "total_s",
-        "mean_s",
-        "median_s",
-        "p95_s",
-    ):
-        summary[f"original_end_to_end_latency_{key}"] = summary[
-            f"end_to_end_latency_{key}"
-        ]
-    summary["end_to_end_latency_mean_ratio_vs_original"] = 1.0
-    summary["end_to_end_latency_mean_delta_s_vs_original"] = 0.0
     return summary
 
 
@@ -739,11 +623,6 @@ def _matched_qa(
         for metric in (
             "answer_survival_rate",
             "empty_prediction_rate",
-            "end_to_end_latency_mean_s",
-            "end_to_end_latency_median_s",
-            "end_to_end_latency_p95_s",
-            "end_to_end_latency_mean_ratio_vs_original",
-            "end_to_end_latency_mean_delta_s_vs_original",
         ):
             s_raw = span_row.get(metric)
             t_raw = token_row.get(metric)
@@ -869,21 +748,19 @@ def main() -> None:
             "drop_rule": "",
             "retention_rate": retention_rate,
         }
-        evaluation_rows, compression_elapsed_s = _timed_compression(
-            compress_token_chunks,
+        evaluation_rows = compress_token_chunks(
             chunks,
             token,
             retention_rate=retention_rate,
             token_counter=token_counter,
             sentence_ids=passage_ids,
-            device=getattr(token, "device", None),
         )
         evaluation_jobs.append(
             (
                 setting,
                 "Token",
                 evaluation_rows,
-                {**metadata, "_compression_elapsed_s": compression_elapsed_s},
+                metadata,
             )
         )
     del token
@@ -899,8 +776,7 @@ def main() -> None:
                     "drop_rule": drop_rule,
                     "retention_rate": retention_rate,
                 }
-                evaluation_rows, compression_elapsed_s = _timed_compression(
-                    compress_span_chunks,
+                evaluation_rows = compress_span_chunks(
                     chunks,
                     spans_by_chunk,
                     L=length,
@@ -914,7 +790,7 @@ def main() -> None:
                         setting,
                         "Span",
                         evaluation_rows,
-                        {**metadata, "_compression_elapsed_s": compression_elapsed_s},
+                        metadata,
                     )
                 )
 
@@ -943,12 +819,11 @@ def main() -> None:
     )
 
     original_predictions: Dict[Tuple[str, str], str] = {}
-    original_latencies: Dict[Tuple[str, str], float] = {}
     for passage in passages:
         passage_id = str(passage["passage_id"])
         for qa in passage["qas"]:
             question_id = str(qa["question_id"])
-            prediction, latency = generate_answer_timed(
+            prediction = generate_answer(
                 model,
                 tokenizer,
                 device,
@@ -959,14 +834,12 @@ def main() -> None:
             )
             key = (passage_id, question_id)
             original_predictions[key] = prediction
-            original_latencies[key] = latency
 
     summaries: List[Dict[str, Any]] = [
         _original_summary(
             passages,
             chunks,
             original_predictions,
-            original_latencies,
             args.qwen_model,
         )
     ]
@@ -985,14 +858,12 @@ def main() -> None:
             passages,
             chunks,
             original_predictions,
-            original_latencies,
             model,
             tokenizer,
             device,
             token_counter,
             args.max_input_tokens,
             args.max_new_tokens,
-            float((metadata or {}).get("_compression_elapsed_s", 0.0)),
         )
         for item in eval_passages:
             item["method"] = method
@@ -1040,13 +911,6 @@ def main() -> None:
     _write_json(
         output_dir / "qa_predictions_original.json",
         _official_original_prediction_map(passages, original_predictions),
-    )
-    _write_json(
-        output_dir / "qa_original_end_to_end_latency.json",
-        {
-            f"{passage_id}::{question_id}": latency
-            for (passage_id, question_id), latency in original_latencies.items()
-        },
     )
     _write_json(
         output_dir / "run_config.json",
