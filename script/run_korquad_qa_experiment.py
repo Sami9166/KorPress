@@ -1,15 +1,13 @@
-"""Run a calibrated end-to-end KorQuAD evaluation for Span and Token.
+"""Run a fixed-retention end-to-end KorQuAD evaluation for Span and Token.
 
 This entry point deliberately starts from the raw KorQuAD question file and
-the current encoder probabilities.  It does not merge, reuse, or post-process
-the old ``qa_eval``/``qa_results`` files.  Qwen3-8B is the default reader and
-tokenizer. It compresses every candidate context, calibrates actual deletion
-rate with the Qwen tokenizer, and by default runs the reader only for the
-nearest settings at each target deletion rate. Use ``--all-settings`` only
-for an exhaustive diagnostic run. Question-level predictions,
-compression/survival statistics, and end-to-end latency are written for the
-evaluated settings. Official KorQuAD EM/F1 is intentionally not
-reimplemented here; prediction JSON files are emitted for the official
+the current encoder probabilities. It does not merge, reuse, or post-process
+the old ``qa_eval``/``qa_results`` files. Qwen3-8B is the default reader and
+tokenizer. Both compressors receive the same retention-rate targets and keep
+their native deletion units while targeting the resulting reader-token budget.
+Question-level predictions, compression/survival statistics, and latency are
+written for every requested setting. Official KorQuAD EM/F1 is intentionally
+not reimplemented here; prediction JSON files are emitted for the official
 evaluator. By default the run uses a deterministic 1,000-question subset;
 pass ``--max-questions 0`` to evaluate every supplied question.
 
@@ -344,7 +342,7 @@ def generate_answer_timed(
 
 
 def _end_to_end_latency_stats(values: Sequence[float]) -> Dict[str, float]:
-    """Summarize per-question end-to-end latency."""
+    """Summarize the measured per-question reader-generation latency."""
     if not values:
         raise ValueError("latency 값이 없습니다.")
     ordered = sorted(float(value) for value in values)
@@ -433,172 +431,46 @@ CompressionJob = Tuple[
 ]
 
 
-def _actual_qwen_deletion_rate(
+def _actual_qwen_retention_rate(
     rows: Sequence[Mapping[str, Any]], token_counter: TokenCounter
 ) -> float:
-    """Return deletion rate measured with the shared Qwen tokenizer."""
+    """Return retained context-token rate measured with the reader tokenizer."""
     original_tokens = sum(token_counter.count(str(row["original"])) for row in rows)
     compressed_tokens = sum(token_counter.count(str(row["compressed"])) for row in rows)
-    return 1.0 - compressed_tokens / max(original_tokens, 1)
+    return compressed_tokens / max(original_tokens, 1)
 
 
-def _selection_row(
-    target: float | str,
+def _setting_row(
     method: str,
     setting: str,
     rows: Sequence[Mapping[str, Any]],
     metadata: Mapping[str, Any],
-    actual_cr: float,
+    token_counter: TokenCounter,
 ) -> Dict[str, Any]:
-    target_gap = ""
-    if target != "":
-        target_gap = abs(actual_cr - float(target))
+    actual_rate = _actual_qwen_retention_rate(rows, token_counter)
+    target_rate = metadata.get("retention_rate", "")
     return {
-        "target_deletion_rate": target,
+        "target_retention_rate": target_rate,
         "method": method,
         "drop_rule": metadata.get("drop_rule", ""),
         "L": metadata.get("L", ""),
-        "threshold": metadata.get("threshold", ""),
-        "retention_rate": metadata.get("retention_rate", ""),
+        "threshold": "",
+        "retention_rate": target_rate,
         "setting": setting,
-        "actual_qwen_token_deletion_rate": actual_cr,
-        "target_cr_gap": target_gap,
+        "actual_qwen_token_retention_rate": actual_rate,
+        "target_retention_gap": (
+            abs(actual_rate - float(target_rate)) if target_rate != "" else ""
+        ),
         "n_passages": len(rows),
         "selected_for_qa": True,
     }
 
 
-def _calibration_pair_rows(
-    calibration_jobs: Sequence[CompressionJob],
-    token_counter: TokenCounter,
-    targets: Sequence[float],
-    max_cr_gap: float,
-    target_tolerance: float,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], set[Tuple[str, str]]]:
-    """Search the full Span×Token candidate grid using contexts only."""
-    span_jobs = [job for job in calibration_jobs if job[1] == "Span"]
-    token_jobs = [job for job in calibration_jobs if job[1] == "Token"]
-    if not span_jobs or not token_jobs:
-        raise ValueError("calibration 후보에는 Span과 Token이 모두 필요합니다.")
-
-    actual_by_key = {
-        (method, setting): _actual_qwen_deletion_rate(rows, token_counter)
-        for setting, method, rows, _ in calibration_jobs
-    }
-    selected_keys: set[Tuple[str, str]] = set()
-    selection_rows: List[Dict[str, Any]] = []
-    grid_rows: List[Dict[str, Any]] = []
-
-    for raw_target in targets:
-        target = float(raw_target)
-        candidates: List[Tuple[Tuple[Any, ...], CompressionJob, CompressionJob, float, float]] = []
-        for span_job in span_jobs:
-            span_cr = actual_by_key[(span_job[1], span_job[0])]
-            for token_job in token_jobs:
-                token_cr = actual_by_key[(token_job[1], token_job[0])]
-                span_gap = abs(span_cr - target)
-                token_gap = abs(token_cr - target)
-                pair_gap = abs(span_cr - token_cr)
-                within = (
-                    span_gap <= target_tolerance
-                    and token_gap <= target_tolerance
-                    and pair_gap <= max_cr_gap
-                )
-                rank = (
-                    0 if within else 1,
-                    max(span_gap, token_gap),
-                    pair_gap,
-                    span_gap + token_gap,
-                    span_job[0],
-                    token_job[0],
-                )
-                candidates.append((rank, span_job, token_job, span_cr, token_cr))
-                grid_rows.append(
-                    {
-                        "target_deletion_rate": target,
-                        "span_setting": span_job[0],
-                        "span_L": span_job[3].get("L", ""),
-                        "span_drop_rule": span_job[3].get("drop_rule", ""),
-                        "span_threshold": span_job[3].get("threshold", ""),
-                        "span_calibration_cr": span_cr,
-                        "token_setting": token_job[0],
-                        "token_threshold": token_job[3].get("threshold", ""),
-                        "token_calibration_cr": token_cr,
-                        "span_target_gap": span_gap,
-                        "token_target_gap": token_gap,
-                        "span_token_cr_gap": pair_gap,
-                        "within_target_tolerance": (
-                            span_gap <= target_tolerance and token_gap <= target_tolerance
-                        ),
-                        "within_max_cr_gap": pair_gap <= max_cr_gap,
-                        "selected": False,
-                    }
-                )
-
-        _, span_job, token_job, span_cr, token_cr = min(candidates, key=lambda item: item[0])
-        selected_keys.add((span_job[1], span_job[0]))
-        selected_keys.add((token_job[1], token_job[0]))
-        pair_gap = abs(span_cr - token_cr)
-        for job, actual_cr in ((span_job, span_cr), (token_job, token_cr)):
-            setting, method, rows, metadata = job
-            row = _selection_row(target, method, setting, rows, metadata, actual_cr)
-            row.update(
-                {
-                    "calibration_actual_cr": actual_cr,
-                    "calibration_target_tolerance": target_tolerance,
-                    "selected_pair_cr_gap": pair_gap,
-                    "selected_pair_within_max_cr_gap": pair_gap <= max_cr_gap,
-                }
-            )
-            selection_rows.append(row)
-        for row in reversed(grid_rows):
-            if (
-                row["target_deletion_rate"] == target
-                and row["span_setting"] == span_job[0]
-                and row["token_setting"] == token_job[0]
-            ):
-                row["selected"] = True
-                break
-    return selection_rows, grid_rows, selected_keys
-
-
-def _select_target_jobs(
-    calibration_jobs: Sequence[CompressionJob],
-    evaluation_jobs: Sequence[CompressionJob],
-    token_counter: TokenCounter,
-    targets: Sequence[float],
-    max_cr_gap: float,
-    target_tolerance: float,
-) -> Tuple[List[CompressionJob], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Select full Span/Token hyperparameter combinations on calibration text."""
-    selection_rows, grid_rows, selected_keys = _calibration_pair_rows(
-        calibration_jobs,
-        token_counter,
-        targets,
-        max_cr_gap,
-        target_tolerance,
-    )
-    selected_jobs = [
-        job for job in evaluation_jobs if (job[1], job[0]) in selected_keys
-    ]
-    if not selected_jobs:
-        raise ValueError("calibration에서 선택된 QA 후보가 없습니다.")
-    return selected_jobs, selection_rows, grid_rows
-
-
-def _all_job_selection_rows(
+def _all_job_setting_rows(
     jobs: Sequence[CompressionJob], token_counter: TokenCounter
 ) -> List[Dict[str, Any]]:
-    """Describe every candidate when exhaustive QA mode is requested."""
     return [
-        _selection_row(
-            "",
-            method,
-            setting,
-            rows,
-            metadata,
-            _actual_qwen_deletion_rate(rows, token_counter),
-        )
+        _setting_row(method, setting, rows, metadata, token_counter)
         for setting, method, rows, metadata in jobs
     ]
 
@@ -704,17 +576,20 @@ def _evaluate_setting(
                 - len(compressed.split()) / max(len(original.split()), 1),
                 "qwen_token_compression_ratio": 1.0
                 - compressed_count / max(original_count, 1),
+                "qwen_token_retention_rate": compressed_count / max(original_count, 1),
                 "qas": output_qas,
             }
         )
 
     if not question_rows:
         raise ValueError(f"QA 항목이 없습니다: {setting}")
-    amortized_compression_s = max(0.0, float(compression_elapsed_s)) / len(question_rows)
-    end_to_end_latencies = [
-        duration + amortized_compression_s for duration in generation_durations
-    ]
-    for row, latency in zip(question_rows, end_to_end_latencies):
+    # Span predictions are loaded from disk while Token scores are produced by
+    # the auxiliary encoder here. Keep the primary latency metric to reader
+    # generation so the two methods have the same measured scope; report the
+    # one-time compression wall time separately for transparency.
+    reader_latencies = generation_durations
+    for row, latency in zip(question_rows, reader_latencies):
+        row["reader_latency_s"] = latency
         row["end_to_end_latency_s"] = latency
     summary: Dict[str, Any] = {
         "method": method,
@@ -723,6 +598,7 @@ def _evaluate_setting(
         "n_questions": len(question_rows),
         "qwen_token_compression_ratio": 1.0
         - compressed_tokens / max(original_tokens, 1),
+        "qwen_token_retention_rate": compressed_tokens / max(original_tokens, 1),
         "eojeol_compression_ratio": 1.0
         - sum(row["n_words_compressed"] for row in eval_passages)
         / max(sum(row["n_words_original"] for row in eval_passages), 1),
@@ -732,8 +608,10 @@ def _evaluate_setting(
             not str(row["pred_compressed"]).strip() for row in question_rows
         )
         / len(question_rows),
+        "compression_wall_time_s": max(0.0, float(compression_elapsed_s)),
+        "latency_scope": "reader_generation_only",
     }
-    summary.update(_end_to_end_latency_stats(end_to_end_latencies))
+    summary.update(_end_to_end_latency_stats(reader_latencies))
     original_timing_stats = _end_to_end_latency_stats(
         [original_latencies[(str(passage["passage_id"]), str(qa["question_id"]))]
          for passage in passages
@@ -788,6 +666,7 @@ def _original_summary(
         "n_passages": len(passages),
         "n_questions": n_questions,
         "qwen_token_compression_ratio": 0.0,
+        "qwen_token_retention_rate": 1.0,
         "eojeol_compression_ratio": 0.0,
         "answer_survival_rate": sum(survival_values) / n_questions,
         "empty_compressed_context_rate": 0.0,
@@ -796,6 +675,8 @@ def _original_summary(
         "threshold": "",
         "drop_rule": "",
         "retention_rate": "",
+        "compression_wall_time_s": 0.0,
+        "latency_scope": "reader_generation_only",
         "qwen_model": qwen_model,
     }
     summary.update(_end_to_end_latency_stats(latency_values))
@@ -815,85 +696,45 @@ def _original_summary(
 
 def _matched_qa(
     summaries: Sequence[Mapping[str, Any]],
-    targets: Sequence[float],
-    max_cr_gap: float,
-    selection_rows: Sequence[Mapping[str, Any]] | None = None,
+    retention_rates: Sequence[float],
 ) -> List[Dict[str, Any]]:
     span = [row for row in summaries if row.get("method") == "Span"]
     token = [row for row in summaries if row.get("method") == "Token"]
     if not span or not token:
         raise ValueError("Span과 Token 결과가 모두 필요합니다.")
 
-    summary_by_key = {
-        (str(row.get("method")), str(row.get("setting"))): row
-        for row in summaries
-    }
-    selected_by_target: Dict[Tuple[float, str], Mapping[str, Any]] = {}
-    for row in selection_rows or []:
-        if row.get("target_deletion_rate", "") == "":
-            continue
-        selected_by_target[
-            (float(row["target_deletion_rate"]), str(row["method"]))
-        ] = row
-
-    def fallback_pair(target: float) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    def closest_pair(target: float) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
         return min(
             ((s, t) for s in span for t in token),
             key=lambda pair: (
                 max(
-                    abs(float(pair[0]["qwen_token_compression_ratio"]) - target),
-                    abs(float(pair[1]["qwen_token_compression_ratio"]) - target),
+                    abs(float(pair[0]["qwen_token_retention_rate"]) - target),
+                    abs(float(pair[1]["qwen_token_retention_rate"]) - target),
                 ),
                 abs(
-                    float(pair[0]["qwen_token_compression_ratio"])
-                    - float(pair[1]["qwen_token_compression_ratio"])
+                    float(pair[0]["qwen_token_retention_rate"])
+                    - float(pair[1]["qwen_token_retention_rate"])
                 ),
             ),
         )
 
     rows: List[Dict[str, Any]] = []
-    for raw_target in targets:
+    for raw_target in retention_rates:
         target = float(raw_target)
-        selected_span = selected_by_target.get((target, "Span"))
-        selected_token = selected_by_target.get((target, "Token"))
-        if selected_span and selected_token:
-            span_row = summary_by_key.get(("Span", str(selected_span["setting"])))
-            token_row = summary_by_key.get(("Token", str(selected_token["setting"])))
-        else:
-            span_row, token_row = fallback_pair(target)
-        if span_row is None or token_row is None:
-            raise ValueError(f"target={target}에 대응하는 QA summary가 없습니다.")
-
-        span_cr = float(span_row["qwen_token_compression_ratio"])
-        token_cr = float(token_row["qwen_token_compression_ratio"])
-        span_target_gap = abs(span_cr - target)
-        token_target_gap = abs(token_cr - target)
-        span_token_gap = abs(span_cr - token_cr)
+        span_row, token_row = closest_pair(target)
+        span_rate = float(span_row["qwen_token_retention_rate"])
+        token_rate = float(token_row["qwen_token_retention_rate"])
         row: Dict[str, Any] = {
-            "target_deletion_rate": target,
+            "target_retention_rate": target,
             "span_drop_rule": span_row.get("drop_rule", ""),
             "span_L": span_row.get("L", ""),
-            "span_threshold": span_row.get("threshold", ""),
             "span_setting": span_row["setting"],
-            "span_actual_cr": span_cr,
-            "span_cr_gap": span_target_gap,
+            "span_actual_retention_rate": span_rate,
+            "span_retention_gap": abs(span_rate - target),
             "token_setting": token_row["setting"],
-            "token_threshold": token_row.get("threshold", ""),
-            "token_actual_cr": token_cr,
-            "token_cr_gap": token_target_gap,
-            "span_token_cr_gap": span_token_gap,
-            "max_cr_gap": max_cr_gap,
-            "pair_within_max_gap": span_token_gap <= max_cr_gap,
-            "span_calibration_cr": (
-                selected_span.get("calibration_actual_cr", "")
-                if selected_span
-                else ""
-            ),
-            "token_calibration_cr": (
-                selected_token.get("calibration_actual_cr", "")
-                if selected_token
-                else ""
-            ),
+            "token_actual_retention_rate": token_rate,
+            "token_retention_gap": abs(token_rate - target),
+            "span_token_retention_gap": abs(span_rate - token_rate),
         }
         for metric in (
             "answer_survival_rate",
@@ -923,9 +764,6 @@ def main() -> None:
     parser.add_argument("--qa-pairs", type=Path, required=True)
     parser.add_argument("--span-records", type=Path, required=True)
     parser.add_argument("--span-predictions", type=Path, required=True)
-    parser.add_argument("--calibration-chunks", type=Path)
-    parser.add_argument("--calibration-span-records", type=Path)
-    parser.add_argument("--calibration-span-predictions", type=Path)
     parser.add_argument(
         "--qwen-model",
         "--qa-model",
@@ -971,40 +809,34 @@ def main() -> None:
     )
     parser.add_argument("--token-max-length", type=int, default=512)
     parser.add_argument(
-        "--token-thresholds",
+        "--retention-rates",
         type=float,
         nargs="+",
-        default=(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
-        help="Token encoder의 DROP 확률 threshold 목록",
+        default=(0.9, 0.8, 0.7),
+        help="압축 후 남길 Qwen reader-token 비율 (예: 0.9 0.8 0.7)",
     )
-    parser.add_argument("--span-L", type=int, nargs="+", default=(1, 2, 4, 8), dest="span_lengths")
-    parser.add_argument("--span-thresholds", type=float, nargs="+", default=(0.5, 0.7, 0.9))
+    parser.add_argument(
+        "--span-L",
+        type=int,
+        nargs="+",
+        default=(8,),
+        dest="span_lengths",
+        help="Span 후보 최대 길이. retention-rate 비교의 Span 구조 설정입니다.",
+    )
     parser.add_argument(
         "--drop-rules",
         nargs="+",
         choices=("max", "mean", "min"),
-        default=("max", "mean", "min"),
-        help="평가할 Span 점수 집계 규칙",
-    )
-    parser.add_argument("--targets", type=float, nargs="+", default=(0.10, 0.20, 0.30))
-    parser.add_argument(
-        "--max-cr-gap",
-        type=float,
-        default=0.02,
-        help="Span과 Token 사이에 허용할 실제 삭제율 차이",
-    )
-    parser.add_argument(
-        "--target-cr-tolerance",
-        type=float,
-        default=0.02,
-        help="각 후보가 목표 삭제율에 들어왔다고 볼 허용 오차",
-    )
-    parser.add_argument(
-        "--all-settings",
-        action="store_true",
-        help="target별 CR에 가까운 설정만 고르지 않고 모든 조합을 QA 평가합니다.",
+        default=("max",),
+        help="Span 점수 집계 규칙. 비교 기본값은 max 하나이며 ablation 시 여러 개를 지정할 수 있습니다.",
     )
     args = parser.parse_args()
+
+    retention_rates = [float(rate) for rate in args.retention_rates]
+    if not retention_rates or len(set(retention_rates)) != len(retention_rates):
+        raise ValueError("--retention-rates에는 중복되지 않은 값을 하나 이상 지정해야 합니다.")
+    if any(not 0.0 <= rate <= 1.0 for rate in retention_rates):
+        raise ValueError("--retention-rates의 모든 값은 0~1이어야 합니다.")
 
     chunks = load_chunks(args.chunks)
     passages = limit_qa_passages(load_qa_passages(args.qa_pairs), args.max_questions)
@@ -1018,74 +850,31 @@ def main() -> None:
     records = read_jsonl(args.span_records)
     predictions = load_span_predictions(args.span_predictions)
     spans_by_chunk = build_spans_by_chunk(records, predictions, chunks)
-    calibration_args = (
-        args.calibration_chunks,
-        args.calibration_span_records,
-        args.calibration_span_predictions,
-    )
-    if any(value is not None for value in calibration_args) and not all(
-        value is not None for value in calibration_args
-    ):
-        raise ValueError(
-            "calibration을 지정할 때는 --calibration-chunks, "
-            "--calibration-span-records, --calibration-span-predictions를 "
-            "모두 지정해야 합니다."
-        )
-    calibration_chunks_path = args.calibration_chunks or args.chunks
-    calibration_records_path = args.calibration_span_records or args.span_records
-    calibration_predictions_path = args.calibration_span_predictions or args.span_predictions
-    calibration_chunks = load_chunks(calibration_chunks_path)
-    calibration_records = read_jsonl(calibration_records_path)
-    calibration_predictions = load_span_predictions(calibration_predictions_path)
-    calibration_spans_by_chunk = build_spans_by_chunk(
-        calibration_records,
-        calibration_predictions,
-        calibration_chunks,
-    )
-    if args.calibration_chunks is None:
-        print(
-            "주의: 별도 calibration 문맥이 없어 QA 문맥을 calibration에도 사용합니다.",
-            flush=True,
-        )
     token_counter = TokenCounter(args.qwen_model)
 
     # Compress first and release each auxiliary encoder before loading the QA
     # reader. This matters on limited-GPU environments when the reader is larger.
     evaluation_jobs: List[CompressionJob] = []
-    calibration_jobs: List[CompressionJob] = []
-    calibration_ids = list(calibration_chunks)
     token = TokenBaselineCompressor(
         args.token_checkpoint,
         tokenizer_name=args.tokenizer,
         device=args.token_device,
         max_length=args.token_max_length,
     )
-    for threshold in args.token_thresholds:
-        setting = f"Token_t{threshold:g}"
+    for retention_rate in retention_rates:
+        setting = f"Token_r{retention_rate:g}"
         metadata = {
             "L": "",
-            "threshold": threshold,
+            "threshold": "",
             "drop_rule": "",
-            "retention_rate": "",
+            "retention_rate": retention_rate,
         }
-        calibration_jobs.append(
-            (
-                setting,
-                "Token",
-                compress_token_chunks(
-                    calibration_chunks,
-                    token,
-                    threshold=threshold,
-                    sentence_ids=calibration_ids,
-                ),
-                metadata,
-            )
-        )
         evaluation_rows, compression_elapsed_s = _timed_compression(
             compress_token_chunks,
             chunks,
             token,
-            threshold=threshold,
+            retention_rate=retention_rate,
+            token_counter=token_counter,
             sentence_ids=passage_ids,
             device=getattr(token, "device", None),
         )
@@ -1102,35 +891,21 @@ def main() -> None:
 
     for drop_rule in args.drop_rules:
         for length in args.span_lengths:
-            for threshold in args.span_thresholds:
-                setting = f"Span_{drop_rule}_L{length}_t{threshold:g}"
+            for retention_rate in retention_rates:
+                setting = f"Span_{drop_rule}_L{length}_r{retention_rate:g}"
                 metadata = {
                     "L": length,
-                    "threshold": threshold,
+                    "threshold": "",
                     "drop_rule": drop_rule,
-                    "retention_rate": "",
+                    "retention_rate": retention_rate,
                 }
-                calibration_jobs.append(
-                    (
-                        setting,
-                        "Span",
-                        compress_span_chunks(
-                            calibration_chunks,
-                            calibration_spans_by_chunk,
-                            L=length,
-                            threshold=threshold,
-                            drop_rule=drop_rule,
-                            sentence_ids=calibration_ids,
-                        ),
-                        metadata,
-                    )
-                )
                 evaluation_rows, compression_elapsed_s = _timed_compression(
                     compress_span_chunks,
                     chunks,
                     spans_by_chunk,
                     L=length,
-                    threshold=threshold,
+                    retention_rate=retention_rate,
+                    token_counter=token_counter,
                     drop_rule=drop_rule,
                     sentence_ids=passage_ids,
                 )
@@ -1153,22 +928,9 @@ def main() -> None:
             "question_ids": question_ids(passages),
         },
     )
-    if args.all_settings:
-        selected_jobs = list(evaluation_jobs)
-        selection_rows = _all_job_selection_rows(evaluation_jobs, token_counter)
-        calibration_grid: List[Dict[str, Any]] = []
-    else:
-        selected_jobs, selection_rows, calibration_grid = _select_target_jobs(
-            calibration_jobs,
-            evaluation_jobs,
-            token_counter,
-            args.targets,
-            args.max_cr_gap,
-            args.target_cr_tolerance,
-        )
-    write_csv(output_dir / "qa_selected_settings.csv", selection_rows)
-    if calibration_grid:
-        write_csv(output_dir / "qa_calibration_grid.csv", calibration_grid)
+    selected_jobs = list(evaluation_jobs)
+    setting_rows = _all_job_setting_rows(evaluation_jobs, token_counter)
+    write_csv(output_dir / "qa_retention_settings.csv", setting_rows)
     print(
         f"QA 압축 후보 {len(evaluation_jobs)}개 중 {len(selected_jobs)}개 설정을 reader 평가합니다.",
         flush=True,
@@ -1265,13 +1027,8 @@ def main() -> None:
 
     write_csv(output_dir / "qa_summary.csv", summaries)
     write_csv(
-        output_dir / "qa_matched_cr.csv",
-        _matched_qa(
-            summaries,
-            args.targets,
-            args.max_cr_gap,
-            selection_rows,
-        ),
+        output_dir / "qa_matched_retention.csv",
+        _matched_qa(summaries, retention_rates),
     )
     _write_json(
         output_dir / "qa_original_predictions.json",

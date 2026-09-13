@@ -643,6 +643,94 @@ class TokenBaselineCompressor:
         scores, _token_ids, truncated, _tokens = self.score_tokens(words)
         return scores, truncated
 
+    def compress_to_retention(
+        self,
+        text: str,
+        retention_rate: float,
+        token_counter: Any | None = None,
+    ) -> Dict[str, Any]:
+        """Keep the highest-ranked subwords within a reader-token budget."""
+        if not 0.0 <= retention_rate <= 1.0:
+            raise ValueError(f"retention_rate는 0~1이어야 합니다: {retention_rate}")
+
+        words, utterance_bounds = text_words_and_utterance_bounds(str(text))
+        scores, token_ids, _truncated, token_texts = self.score_tokens(
+            words, utterance_bounds
+        )
+        counter = token_counter.count if token_counter is not None else None
+        count = counter or (lambda value: len(self.tokenizer.encode(value, add_special_tokens=False)))
+        original_text = str(text).strip()
+        original_tokens = int(count(original_text))
+        target_tokens = round(original_tokens * retention_rate)
+
+        def render(indices: set[int]) -> str:
+            kept_ids = [token_ids[index] for index in range(len(token_ids)) if index in indices]
+            return self.tokenizer.decode(
+                kept_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+
+        kept = set(range(len(token_ids)))
+        current_text = render(kept)
+        current_tokens = int(count(current_text))
+        if retention_rate < 1.0:
+            # ponytail: O(n²) decode/count scan; add incremental accounting if
+            # long-context profiling shows this is a bottleneck.
+            candidates = [
+                index
+                for index in sorted(
+                    range(len(token_ids)),
+                    key=lambda item: (-float(scores[item]), item),
+                )
+                if not _is_punctuation_piece(token_texts[index])
+            ]
+            deferred: List[int] = []
+            for index in candidates:
+                proposed = kept - {index}
+                proposed_tokens = int(count(render(proposed)))
+                if proposed_tokens >= target_tokens:
+                    kept = proposed
+                    current_tokens = proposed_tokens
+                else:
+                    deferred.append(index)
+
+            # A subword can cross the target because decoding changes spacing.
+            # Choose the closest deferred candidate when no exact step fits.
+            while current_tokens > target_tokens and deferred:
+                options = []
+                for index in deferred:
+                    proposed = kept - {index}
+                    proposed_tokens = int(count(render(proposed)))
+                    options.append(
+                        (
+                            abs(proposed_tokens - target_tokens),
+                            proposed_tokens < target_tokens,
+                            -float(scores[index]),
+                            index,
+                            proposed,
+                            proposed_tokens,
+                        )
+                    )
+                fitting = [option for option in options if option[1] is False]
+                chosen = min(fitting or options, key=lambda option: option[:4])
+                _, _, _, index, kept, current_tokens = chosen
+                deferred.remove(index)
+                if current_tokens < target_tokens:
+                    break
+
+        compressed = render(kept)
+        return {
+            "original": original_text,
+            "compressed": compressed,
+            "retention_rate": retention_rate,
+            "target_qwen_tokens": target_tokens,
+            "actual_qwen_tokens": int(count(compressed)),
+            "n_tokens_original": len(token_ids),
+            "n_tokens_compressed": len(kept),
+            "n_tokens_dropped": len(token_ids) - len(kept),
+        }
+
     def compress(self, text: str, threshold: float) -> str:
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"token threshold는 0~1이어야 합니다: {threshold}")

@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 try:  # Running from a script with ``src`` on sys.path
-    from compressor import compress
+    from compressor import compress, compress_to_retention
     from token_baseline import TokenBaselineCompressor
 except ImportError:  # Running as an imported package
-    from .compressor import compress
+    from .compressor import compress, compress_to_retention
     from .token_baseline import TokenBaselineCompressor
 
 
@@ -148,10 +148,15 @@ def compress_span_chunks(
     chunks: Mapping[str, str],
     spans_by_chunk: Mapping[str, Sequence[Mapping[str, Any]]],
     L: int,
-    threshold: float,
-    drop_rule: str,
+    threshold: float | None = None,
+    drop_rule: str = "max",
     sentence_ids: Sequence[str] | None = None,
+    retention_rate: float | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> List[Dict[str, Any]]:
+    """Compress chunks with a legacy threshold or a shared retention target."""
+    if threshold is not None and retention_rate is not None:
+        raise ValueError("threshold와 retention_rate를 동시에 지정할 수 없습니다.")
     selected = sentence_ids if sentence_ids is not None else list(chunks)
     rows: List[Dict[str, Any]] = []
     for sentence_id in selected:
@@ -162,15 +167,28 @@ def compress_span_chunks(
             for word in words
             if PUNCTUATION_ONLY_RE.fullmatch(str(word["text"]))
         }
-        result = compress(
-            words,
-            list(spans_by_chunk.get(sentence_id, [])),
-            L=L,
-            threshold=threshold,
-            use_dummy=False,
-            drop_rule=drop_rule,
-            protected_word_ids=protected_word_ids,
-        )
+        if retention_rate is not None:
+            result = compress_to_retention(
+                words,
+                list(spans_by_chunk.get(sentence_id, [])),
+                L=L,
+                retention_rate=retention_rate,
+                drop_rule=drop_rule,
+                protected_word_ids=protected_word_ids,
+                token_counter=token_counter,
+            )
+        else:
+            if threshold is None:
+                raise ValueError("threshold 또는 retention_rate가 필요합니다.")
+            result = compress(
+                words,
+                list(spans_by_chunk.get(sentence_id, [])),
+                L=L,
+                threshold=threshold,
+                use_dummy=False,
+                drop_rule=drop_rule,
+                protected_word_ids=protected_word_ids,
+            )
         result["sentence_id"] = sentence_id
         result["method"] = "Span"
         rows.append(result)
@@ -180,27 +198,50 @@ def compress_span_chunks(
 def compress_token_chunks(
     chunks: Mapping[str, str],
     compressor: TokenBaselineCompressor,
-    threshold: float,
+    threshold: float | None = None,
     sentence_ids: Sequence[str] | None = None,
+    retention_rate: float | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> List[Dict[str, Any]]:
     """Compress contexts with target-only subword scoring windows.
 
     Neighboring utterances are encoder context; only the target utterance's
     subwords are scored and removed. Punctuation-only subword pieces are kept
-    by ``TokenBaselineCompressor`` to match the controlled Span policy.
+    by ``TokenBaselineCompressor`` to match the controlled Span policy. When
+    ``retention_rate`` is supplied, the shared reader-token counter defines
+    the target budget; ``threshold`` remains only for legacy callers.
     """
+    if threshold is not None and retention_rate is not None:
+        raise ValueError("threshold와 retention_rate를 동시에 지정할 수 없습니다.")
     selected = sentence_ids if sentence_ids is not None else list(chunks)
     rows: List[Dict[str, Any]] = []
     for sentence_id in selected:
         original = chunks[sentence_id]
-        compressed = compressor.compress(original, threshold=threshold)
+        if retention_rate is not None:
+            result = compressor.compress_to_retention(
+                original,
+                retention_rate=retention_rate,
+                token_counter=token_counter,
+            )
+            compressed = result["compressed"]
+        else:
+            if threshold is None:
+                raise ValueError("threshold 또는 retention_rate가 필요합니다.")
+            compressed = compressor.compress(original, threshold=threshold)
         rows.append(
             {
                 "sentence_id": sentence_id,
                 "method": "Token",
                 "original": original,
                 "compressed": compressed,
-                "threshold": threshold,
+                "threshold": threshold if retention_rate is None else "",
+                "retention_rate": retention_rate,
+                "target_qwen_tokens": result.get("target_qwen_tokens", "")
+                if retention_rate is not None
+                else "",
+                "actual_qwen_tokens": result.get("actual_qwen_tokens", "")
+                if retention_rate is not None
+                else "",
                 "n_words_original": len(original.split()),
                 "n_words_compressed": len(compressed.split()),
                 "n_words_dropped": len(original.split()) - len(compressed.split()),

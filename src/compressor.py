@@ -2,7 +2,7 @@
 compressor.py
 
 학습된 인코더로 각 span의 p(DROP)을 계산한 뒤(여기서는 더미/실제 라벨로 대체
-가능), L·threshold를 적용하고 중첩 span 충돌을 처리해 압축문을 생성한다.
+가능), L과 retention rate를 적용하고 중첩 span 충돌을 처리해 압축문을 생성한다.
 
 핵심: 이 파일의 로직(L 필터링 ~ 압축문 생성)은 p_drop이 "진짜 인코더 출력"이든
 "랜덤 더미 값"이든 "실제 라벨(auto_label)"이든 상관없이 동일하게 작동한다.
@@ -10,9 +10,10 @@ compressor.py
 구현·검증해두고, checkpoint가 나오면 predict_with_encoder()만 실제
 모델 추론으로 갈아끼우면 된다.
 
-``max`` 규칙은 threshold를 넘은 큰 span을 먼저 확정하고, 그 안에 완전히
-포함되는 작은 span을 강제 DROP한다. 최종 삭제 어절은 최종 DROP span들의
-word_ids 합집합으로 계산한다.
+기존 ``compress`` 경로는 threshold 호환성을 유지한다. QA 경로의
+``compress_to_retention``은 p_drop 순으로 원자적 span을 선택해 reader-token
+보존율 목표에 맞춘다. 최종 삭제 어절은 선택된 span들의 word_ids 합집합으로
+계산한다.
 
 사용법:
     python compressor.py --demo                 # 더미 확률로 데모
@@ -22,7 +23,7 @@ word_ids 합집합으로 계산한다.
 import argparse
 import random
 from collections import defaultdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Mapping
 
 
 # ============================================================
@@ -251,6 +252,137 @@ def compress_sentence(
     }
 
 
+def compress_to_retention(
+    words: List[Dict[str, Any]],
+    spans: List[Dict[str, Any]],
+    L: int,
+    retention_rate: float,
+    drop_rule: str = "max",
+    protected_word_ids: set | None = None,
+    token_counter: Any | None = None,
+) -> Dict[str, Any]:
+    """Compress by ranked deletion until the requested reader-token budget.
+
+    The classifier still supplies ``p_drop`` scores; ``retention_rate`` only
+    replaces the threshold decision at inference time. Span/word deletion
+    units remain intact, while the optional counter measures the downstream
+    reader tokens shared by all methods.
+    """
+    if not 0.0 <= retention_rate <= 1.0:
+        raise ValueError(f"retention_rate는 0~1이어야 합니다: {retention_rate}")
+
+    spans = filter_by_L(_flatten_spans(spans), L)
+    protected = set(protected_word_ids or ())
+    original_result = compress_sentence(words, set(), protected)
+    counter = token_counter.count if token_counter is not None else lambda text: len(text.split())
+    original_tokens = int(counter(original_result["original"]))
+    target_tokens = round(original_tokens * retention_rate)
+
+    if retention_rate >= 1.0 or not spans:
+        result = original_result
+        result.update(
+            {
+                "L": L,
+                "retention_rate": retention_rate,
+                "target_qwen_tokens": target_tokens,
+                "actual_qwen_tokens": original_tokens,
+                "threshold": "",
+                "drop_rule": drop_rule,
+                "n_spans_considered": len(spans),
+                "n_spans_dropped": 0,
+                "n_forced_by_parent": None,
+            }
+        )
+        return result
+
+    if drop_rule == "max":
+        candidates = sorted(
+            spans,
+            key=lambda span: (
+                -float(span.get("p_drop", 0.0)),
+                -_span_size(span),
+                str(span.get("span_id", "")),
+            ),
+        )
+    else:
+        word_scores = compute_word_scores(spans, mode=drop_rule)
+        candidates = [
+            {"word_ids": [word_id], "p_drop": score, "size": 1, "span_id": f"word_{word_id}"}
+            for word_id, score in word_scores.items()
+        ]
+        candidates.sort(key=lambda span: (-float(span["p_drop"]), int(span["word_ids"][0])))
+
+    drop_ids: set[int] = set()
+    deferred: List[Dict[str, Any]] = []
+    dropped_units = 0
+
+    def try_drop(candidate: Mapping[str, Any]) -> tuple[set[int], int]:
+        proposed_ids = drop_ids | set(candidate.get("word_ids", ()))
+        proposed_ids -= protected
+        proposed = compress_sentence(words, proposed_ids, protected)
+        return proposed_ids, int(counter(proposed["compressed"]))
+
+    current_tokens = original_tokens
+    # ponytail: O(n²) re-render/count scan; replace with incremental token
+    # accounting only if long-context profiling shows this is a bottleneck.
+    for candidate in candidates:
+        proposed_ids, proposed_tokens = try_drop(candidate)
+        if proposed_ids == drop_ids:
+            continue
+        if proposed_tokens >= target_tokens:
+            drop_ids = proposed_ids
+            current_tokens = proposed_tokens
+            dropped_units += 1
+        else:
+            deferred.append(candidate)
+
+    # A final atomic span can cross the budget. Pick the closest available
+    # candidate so the output is deterministic and never silently over-targets.
+    if current_tokens > target_tokens and deferred:
+        remaining = list(deferred)
+        while remaining and current_tokens > target_tokens:
+            scored = []
+            for candidate in remaining:
+                proposed_ids, proposed_tokens = try_drop(candidate)
+                if proposed_ids != drop_ids:
+                    scored.append(
+                        (
+                            abs(proposed_tokens - target_tokens),
+                            proposed_tokens < target_tokens,
+                            -float(candidate.get("p_drop", 0.0)),
+                            str(candidate.get("span_id", "")),
+                            candidate,
+                            proposed_ids,
+                            proposed_tokens,
+                        )
+                    )
+            if not scored:
+                break
+            fitting = [item for item in scored if item[1] is False]
+            chosen = min(fitting or scored, key=lambda item: item[:4])
+            _, _, _, _, candidate, drop_ids, current_tokens = chosen
+            dropped_units += 1
+            remaining.remove(candidate)
+            if current_tokens < target_tokens:
+                break
+
+    result = compress_sentence(words, drop_ids, protected)
+    result.update(
+        {
+            "L": L,
+            "retention_rate": retention_rate,
+            "target_qwen_tokens": target_tokens,
+            "actual_qwen_tokens": int(counter(result["compressed"])),
+            "threshold": "",
+            "drop_rule": drop_rule,
+            "n_spans_considered": len(spans),
+            "n_spans_dropped": dropped_units,
+            "n_forced_by_parent": None,
+        }
+    )
+    return result
+
+
 # ============================================================
 # 6. 전체 파이프라인 한 번에
 # ============================================================
@@ -388,6 +520,27 @@ def self_test():
     )
     assert result["n_forced_by_parent"] == 2, (
         "[self_test 실패] 자식 span 강제 DROP 수가 예상과 다름"
+    )
+
+    class WordCounter:
+        def count(self, text: str) -> int:
+            return len(text.split())
+
+    retention_result = compress_to_retention(
+        words,
+        [
+            {"size": 1, "word_ids": [1], "p_drop": 0.9},
+            {"size": 1, "word_ids": [2], "p_drop": 0.8},
+            {"size": 1, "word_ids": [3], "p_drop": 0.1},
+            {"size": 1, "word_ids": [4], "p_drop": 0.0},
+        ],
+        L=1,
+        retention_rate=0.5,
+        token_counter=WordCounter(),
+    )
+    assert retention_result["target_qwen_tokens"] == 2
+    assert retention_result["actual_qwen_tokens"] == 2, (
+        "[self_test 실패] retention-rate가 reader-token 예산을 맞추지 못함"
     )
 
     return True

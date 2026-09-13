@@ -7,7 +7,7 @@
 ```text
 src/
   dependency_spans.py          # Stanza 파싱 + dependency span 후보 생성
-  compressor.py                # L/threshold/drop-rule 압축 로직
+  compressor.py                # L/retention-rate/drop-rule 압축 로직
   span_encoder_data.py         # span encoder JSONL·문맥 window·정렬
   span_encoder_model.py        # KLUE-RoBERTa contextual span classifier
   evaluate_compression.py      # 수치·날짜·부정어·문법 보존 지표
@@ -24,7 +24,7 @@ script/
   predict_span_encoder.py      # encoder DROP 확률 생성
   run_grid.py                  # 선택 진단: 문법·고유명사·압축 latency grid
   run_intrinsic_experiment.py  # Span hyperparameter intrinsic sweep
-  run_korquad_qa_experiment.py # calibration 후 Span/Token QA 재평가
+  run_korquad_qa_experiment.py # 같은 retention rate의 Span/Token QA 재평가
   measure_korquad_lengths.py   # 공식 KorQuAD context 최대 길이 확인
   prepare_korquad_dev.py       # 공식 dev raw JSON/ZIP → QA·span 입력 생성
   prepare_subword_teacher_input.py # KLUE tokenizer 기반 ChatGPT 입력 생성
@@ -66,10 +66,10 @@ python script/run_intrinsic_experiment.py --chunks chunks.csv --span-records pre
 python script/measure_korquad_lengths.py --input /path/to/KorQuAD_2.1_dev_00.zip /path/to/KorQuAD_2.1_dev_01.zip
 python script/prepare_korquad_dev.py --output-dir data/korquad_dev --hf-dataset LGCNS/KorQuAD_2.0 --hf-split validation --tokenizer Qwen/Qwen3-8B --max-context-tokens 3000 --max-questions 1000 --seed 42 --download-stanza
 python script/predict_span_encoder.py --checkpoint runs/span_encoder/best_model --data data/korquad_dev/spans.jsonl --chunks data/korquad_dev/chunks.csv --output data/korquad_dev/span_predictions.csv.gz --batch-size 4 --max-length 512
-python script/run_korquad_qa_experiment.py --chunks data/korquad_dev/chunks.csv --qa-pairs data/korquad_dev/qa_pairs.json --span-records data/korquad_dev/spans.jsonl --span-predictions data/korquad_dev/span_predictions.csv.gz --calibration-chunks data/korquad_dev/calibration_chunks.csv --calibration-span-records data/korquad_dev/calibration_spans.jsonl --calibration-span-predictions data/korquad_dev/calibration_span_predictions.csv.gz --token-checkpoint runs/token_klue_roberta_base/best_model --output-dir experiments/qa_qwen3_8b --qwen-model Qwen/Qwen3-8B --torch-dtype float16 --max-questions 1000
+python script/run_korquad_qa_experiment.py --chunks data/korquad_dev/chunks.csv --qa-pairs data/korquad_dev/qa_pairs.json --span-records data/korquad_dev/spans.jsonl --span-predictions data/korquad_dev/span_predictions.csv.gz --token-checkpoint runs/token_klue_roberta_base/best_model --output-dir experiments/qa_qwen3_8b --qwen-model Qwen/Qwen3-8B --torch-dtype float16 --max-questions 1000 --retention-rates 0.9 0.8 0.7 --span-L 8 --drop-rules max
 python script/prepare_subword_teacher_input.py --chunks chunks.csv --tokenizer klue/roberta-base --tokenizer-path encoder/klue_roberta_base_mean_max/best_model/tokenizer --output data/subword_teacher_input.jsonl
 python script/convert_subword_teacher_output.py --teacher-input data/subword_teacher_input.jsonl --teacher-output data/subword_teacher_output.jsonl --output data/subword_labels.csv.gz
-python script/token_baseline.py train --chunks chunks.csv --labels data/subword_labels.csv.gz --output-dir runs/token_klue_roberta_base --model-name klue/roberta-base --tokenizer-name encoder/klue_roberta_base_mean_max/best_model/tokenizer --max-length 512 --batch-size 8 --epochs 3 --fp16 --device cuda
+python script/token_baseline.py train --chunks chunks.csv --labels data/subword_labels.csv.gz --split-manifest prepared/aihub/split_manifest.csv --output-dir runs/token_klue_roberta_base --model-name klue/roberta-base --tokenizer-name encoder/klue_roberta_base_mean_max/best_model/tokenizer --max-length 512 --batch-size 8 --epochs 3 --fp16 --device cuda
 ```
 
 `run_intrinsic_experiment.py`는 Token을 비교하지 않고 Span의 `L`, `drop_rule`,
@@ -78,26 +78,23 @@ python script/token_baseline.py train --chunks chunks.csv --labels data/subword_
 `threshold={0.5,0.7,0.9}`(36개)입니다. `intrinsic_summary.csv`가 전체 결과이고
 `intrinsic_selected_settings.csv`는 목표 삭제율별 대표 Span 설정입니다.
 
-QA는 calibration 문맥에서 전달된 **전체 Span/Token 후보 조합**을 실제 Qwen tokenizer
-삭제율로 비교합니다. 목표 삭제율(`--targets`, 기본 10/20/30%)별로 가장 가까우면서
-Span–Token CR 차이가 작은 조합을 선택하고, 선택된 설정만 QA 전체 문맥에서 reader로
-평가합니다. 기본 QA 실행은 입력 순서의 고정 1,000문항 subset을 사용하며,
-`--max-questions 0`을 지정하면 입력된 전체 질문을 사용합니다. 선택 결과는
-`qa_selected_settings.csv`, 전체 조합 진단은
-`qa_calibration_grid.csv`에 저장됩니다. `--all-settings`를 주면 calibration 선택을
-건너뛰고 모든 평가 후보를 실행합니다. 별도 calibration 경로를 생략하면 QA 문맥을
-fallback으로 사용하므로 최종 실험에서는 별도 문맥을 지정해야 합니다. QA는 원문 조건을
-먼저 실행해 `qa_original_summary.json`에 원문 end-to-end latency와 answer survival 기준을
-저장하고, 압축 조건에는 압축 문맥의 end-to-end latency와 answer survival을 기록합니다. 공식
-KorQuAD EM/F1은 이 스크립트에서 임의로 재구현하지 않으며, 각 설정의
+QA 비교는 threshold/calibration sweep 대신 `--retention-rates` 하나를 공통 제약으로
+사용합니다. 각 context의 원문을 Qwen reader tokenizer로 세어
+`round(original_tokens × retention_rate)`를 목표로 삼고, Span은 원자적 dependency
+span(어절), Token은 원자적 subword를 p_drop 내림차순으로 제거합니다. 삭제 단위가
+다르므로 목표와 실제 보존율이 약간 다를 수 있으며, `qa_retention_settings.csv`에
+target/actual/gap을 모두 기록합니다. Span의 `L`과 `drop_rule`은 구조적 설정이며
+기본값은 `L=8`, `drop_rule=max` 하나입니다. 여러 값을 지정하면 retention rate는
+그대로 둔 채 별도 ablation 설정을 평가합니다. 기본 QA 실행은 입력 순서의 고정
+1,000문항 subset을 사용하고, `--max-questions 0`이면 입력된 전체 질문을 사용합니다.
+공식 KorQuAD EM/F1은 이 스크립트에서 임의로 재구현하지 않으며, 각 설정의
 `qa_predictions_*.json`과 원문용 `qa_predictions_original.json`을 공식 evaluator에
-입력해 계산합니다. 질문별 end-to-end latency는
-`qa_results_*.json`의 `end_to_end_latency_s`에, 집계값(mean/median/p95/total)은
-`qa_summary.csv`에 저장됩니다. 원문 timing 원자료는
-`qa_original_end_to_end_latency.json`에 저장됩니다. End-to-end latency는 모델 로딩과
-calibration을 제외한 압축 실행 및 Qwen reader 생성 시간이며, CUDA에서는 전후 synchronize
-후 측정합니다. 같은 context에 질문이 여러 개면 압축 시간은 질문 수에 비례해 amortize합니다. 모델을
-바꾸려면 두 명령 모두 `--qwen-model` 하나만 지정합니다(`--qwen-tokenizer`, `--qa-model`은
+입력해 계산합니다. 질문별 reader latency는 `qa_results_*.json`의
+`end_to_end_latency_s`(호환용 필드)에, 집계값(mean/median/p95/total)은
+`qa_summary.csv`에 저장됩니다. Span prediction은 파일에서 읽고 Token score는
+보조 encoder로 계산하므로, 공정한 주 비교를 위해 latency에는 Qwen reader 생성만
+포함하고 설정별 일회성 압축 시간은 `compression_wall_time_s`로 별도 기록합니다.
+모델을 바꾸려면 `--qwen-model` 하나만 지정합니다(`--qwen-tokenizer`, `--qa-model`은
 호환용 별칭).
 
 공식 점수는 KorQuAD에서 제공하는 evaluator를 사용합니다. 예를 들어 dev 원본 파일과
@@ -111,7 +108,7 @@ maximum과 현재 QA 기본값 4,096을 모두 넘습니다. 따라서 원본을
 그 chunk 입력을 공식 evaluator에 연결해야 합니다.
 
 ```powershell
-python evaluate-korquad_2.0.py path/to/KorQuAD_v2.1_dev.json experiments/qa_qwen3_8b/qa_predictions_Span_max_L8_t0.7.json
+python evaluate-korquad_2.0.py path/to/KorQuAD_v2.1_dev.json experiments/qa_qwen3_8b/qa_predictions_Span_max_L8_r0.7.json
 ```
 
 이 명령은 원문/압축 prediction 파일 각각에 대해 공식 EM/F1을 계산합니다. 저장소의
@@ -133,8 +130,8 @@ Intrinsic의 주 비교 표 항목은 목표 삭제율, method/rule/L/threshold,
 
 Token teacher 출력은 `subword_labels.csv.gz`로 변환한 뒤 subword 단위로 학습합니다.
 라벨 생성·학습·추론에 같은 KLUE tokenizer를 사용해야 합니다.
-추론에서도 각 subword의 DROP 확률을 threshold와 비교하고, KEEP한 subword ID만
-tokenizer로 decode합니다. 각 target utterance는 주변 utterance를 context로 포함한
+QA 추론에서는 각 subword의 DROP 확률을 retention budget 안에서 순위화하고, 선택한
+subword ID만 tokenizer로 decode합니다. 각 target utterance는 주변 utterance를 context로 포함한
 window에서 처리하지만, 학습 loss와 추론 score는 target utterance의 subword에만
 적용합니다. 512-subword budget을 넘는 utterance는 단어 경계에서 여러 target window로
 나누며, 각 subword는 정확히 한 window에서만 supervision/score를 받습니다. 하나의
