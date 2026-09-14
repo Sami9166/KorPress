@@ -16,16 +16,12 @@ src/
 script/
   prepare_aihub_input.py       # AI Hub chunks.csv → 문장/metadata
   build_span_candidates.py     # 파싱 + L별 span 후보 생성
-  check_integrity.py           # 후보 JSON 전수 구조 검사
-  print_readable_trees.py      # dependency tree 샘플 확인
   prepare_span_data.py         # span_labels.csv.gz → train/val/test JSONL
   verify_span_data.py          # 준비 데이터 개수·라벨 검증
   train_span_encoder.py        # span encoder 학습·resume
   predict_span_encoder.py      # encoder DROP 확률 생성
-  run_grid.py                  # 선택 진단: 문법·고유명사·압축 latency grid
   run_intrinsic_experiment.py  # Span hyperparameter intrinsic sweep
   run_korquad_qa_experiment.py # 같은 retention rate의 Span/Token QA 재평가
-  measure_korquad_lengths.py   # 공식 KorQuAD context 최대 길이 확인
   prepare_korquad_dev.py       # 공식 dev raw JSON/ZIP → QA·span 입력 생성
   prepare_subword_teacher_input.py # KLUE tokenizer 기반 ChatGPT 입력 생성
   convert_subword_teacher_output.py # teacher keep_indices → subword label CSV
@@ -63,7 +59,6 @@ python script/prepare_span_data.py --chunks chunks.csv --spans span_labels.csv.g
 python script/train_span_encoder.py --data-dir prepared/aihub --chunks chunks.csv --output-dir runs/span_encoder --model-name klue/roberta-base --pooling mean_max --precision fp16
 python script/predict_span_encoder.py --checkpoint runs/span_encoder/best_model --data prepared/aihub/test.jsonl --chunks chunks.csv --output runs/span_encoder/test_predictions.csv.gz
 python script/run_intrinsic_experiment.py --chunks chunks.csv --span-records prepared/aihub/validation.jsonl --span-predictions runs/span_encoder/validation_predictions.csv.gz --output-dir experiments/intrinsic_qwen3_8b_validation --qwen-model Qwen/Qwen3-8B --drop-rules max mean min
-python script/measure_korquad_lengths.py --input /path/to/KorQuAD_2.1_dev_00.zip /path/to/KorQuAD_2.1_dev_01.zip
 python script/prepare_korquad_dev.py --output-dir data/korquad_dev --hf-dataset LGCNS/KorQuAD_2.0 --hf-split validation --tokenizer Qwen/Qwen3-8B --max-context-tokens 3000 --max-questions 1000 --seed 42 --download-stanza
 python script/predict_span_encoder.py --checkpoint runs/span_encoder/best_model --data data/korquad_dev/spans.jsonl --chunks data/korquad_dev/chunks.csv --output data/korquad_dev/span_predictions.csv.gz --batch-size 4 --max-length 512
 python script/run_korquad_qa_experiment.py --chunks data/korquad_dev/chunks.csv --qa-pairs data/korquad_dev/qa_pairs.json --span-records data/korquad_dev/spans.jsonl --span-predictions data/korquad_dev/span_predictions.csv.gz --token-checkpoint runs/token_klue_roberta_base/best_model --output-dir experiments/qa_qwen3_8b --qwen-model Qwen/Qwen3-8B --torch-dtype float16 --max-questions 1000 --retention-rates 0.9 0.8 0.7 --span-L 8 --drop-rules max
@@ -87,16 +82,16 @@ target/actual/gap을 모두 기록합니다. Span의 `L`과 `drop_rule`은 구�
 기본값은 `L=8`, `drop_rule=max` 하나입니다. 여러 값을 지정하면 retention rate는
 그대로 둔 채 별도 ablation 설정을 평가합니다. 기본 QA 실행은 입력 순서의 고정
 1,000문항 subset을 사용하고, `--max-questions 0`이면 입력된 전체 질문을 사용합니다.
-공식 KorQuAD EM/F1은 이 스크립트에서 임의로 재구현하지 않으며, 각 설정의
-`qa_predictions_*.json`과 원문용 `qa_predictions_original.json`을 공식 evaluator에
-입력해 계산합니다. `qa_summary.csv`에는 retention rate, 압축률, answer survival만
-기록합니다. Latency는 dependency parsing이 학습/전처리 단계에만 해당하고
-Span prediction과 Token scoring 경로도 달라 주 비교 지표에서 제외했습니다.
-모델을 바꾸려면 `--qwen-model` 하나만 지정합니다(`--qwen-tokenizer`, `--qa-model`은
+공식 KorQuAD EM/F1은 실행 시 공식 `evaluate-2.0.py`를 자동으로 내려받아 원문과
+각 설정에 대해 계산합니다. `qa_pairs.json` 옆에 `gold_subset.json`이 있으면 이를
+사용하고, 없으면 QA 입력에서 평가 질문에 맞는 gold를 자동 생성합니다. 공식 점수는
+`qa_summary.csv`와 `qa_original_summary.json`의 `official_exact_match`,
+`official_f1`에 기록되고, 원자료와 evaluator 출력은
+`qa_official_eval_*.json`에 저장됩니다. 이미 받은 evaluator를 사용하려면
+`--official-evaluator path/to/evaluate-2.0.py`, 공식 gold를 직접 지정하려면
+`--gold-json path/to/dev.json`을 사용합니다. 모델을 바꾸려면
+`--qwen-model` 하나만 지정합니다(`--qwen-tokenizer`, `--qa-model`은
 호환용 별칭).
-
-공식 점수는 KorQuAD에서 제공하는 evaluator를 사용합니다. 예를 들어 dev 원본 파일과
-한 설정의 prediction 파일을 준비한 뒤 다음처럼 실행합니다.
 
 공식 KorQuAD 2.1 dev 원본을 직접 측정한 결과는 4,736개 context와 10,165개 QA이며,
 최장 context는 Qwen3 tokenizer 기준 207,390 token, `klue/roberta-base` 기준
@@ -105,17 +100,13 @@ maximum과 현재 QA 기본값 4,096을 모두 넘습니다. 따라서 원본을
 말고, 동일한 deterministic chunk/retrieval 전처리를 원문·Span·Token에 공통 적용한 뒤
 그 chunk 입력을 공식 evaluator에 연결해야 합니다.
 
-```powershell
-python evaluate-korquad_2.0.py path/to/KorQuAD_v2.1_dev.json experiments/qa_qwen3_8b/qa_predictions_Span_max_L8_r0.7.json
-```
-
-이 명령은 원문/압축 prediction 파일 각각에 대해 공식 EM/F1을 계산합니다. 저장소의
-`qa_summary.csv`에는 공식 점수 대신 압축률, retention rate, answer survival만 남깁니다.
-1,000문항 실행의 질문 목록은 `question_ids.json`과 QA 결과의 `qa_question_ids.json`에
-저장되므로, 공식 evaluator를
-사용할 때는 동일한 question ID만 포함한 gold subset을 함께 사용해야 합니다.
+QA runner가 자동으로 공식 evaluator를 호출하므로 별도 수동 명령은 필요하지 않습니다.
+공식 점수와 압축률, retention rate, answer survival이 함께 `qa_summary.csv`에 기록됩니다.
+평가 질문 목록은 `question_ids.json`과 QA 결과의 `qa_question_ids.json`에 저장되며,
+runner가 동일한 question ID만 포함한 gold subset을 evaluator에 전달합니다.
 현재 reader 입력이 `--max-input-tokens`를 넘으면 양쪽 조건을 조용히 자르지 않고
-오류를 냅니다. 공식 dev context 길이는 `measure_korquad_lengths.py`로 먼저 확인하고,
+오류를 냅니다. 공식 dev context는 `prepare_korquad_dev.py`의 동일한
+`--max-context-tokens` 전처리로 먼저 나누고,
 필요하면 원문·압축문에 같은 retrieval/window 규칙을 적용해야 합니다. 한 조건만 잘라서
 압축 효과와 입력 truncation 효과가 섞이지 않도록 합니다.
 

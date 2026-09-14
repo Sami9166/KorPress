@@ -1,15 +1,15 @@
 """Run a fixed-retention KorQuAD QA evaluation for Span and Token.
 
 This entry point deliberately starts from the raw KorQuAD question file and
-the current encoder probabilities. It does not merge, reuse, or post-process
-the old ``qa_eval``/``qa_results`` files. Qwen3-8B is the default reader and
+the current encoder probabilities.  It does not merge, reuse, or post-process
+the old ``qa_eval``/``qa_results`` files.  Qwen3-8B is the default reader and
 tokenizer. Both compressors receive the same retention-rate targets and keep
 their native deletion units while targeting the resulting reader-token budget.
 Question-level predictions and compression/survival statistics are written
-for every requested setting. Official KorQuAD EM/F1 is intentionally
-not reimplemented here; prediction JSON files are emitted for the official
-evaluator. By default the run uses a deterministic 1,000-question subset;
-pass ``--max-questions 0`` to evaluate every supplied question.
+for every requested setting. The official KorQuAD 2.0 evaluator is downloaded
+(or a user-provided copy is used) and run automatically for the original and
+every evaluated setting. By default the run uses a deterministic 1,000-question
+subset; pass ``--max-questions 0`` to evaluate every supplied question.
 
 The context used for compression is ``chunks.csv``.  That file is the source
 whose eojeol indices the dependency-span records refer to; the context string
@@ -20,10 +20,13 @@ applying span indices to a differently tokenized string.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
+import subprocess
 import sys
 import unicodedata
+from urllib.request import urlopen
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
@@ -61,6 +64,11 @@ except ImportError:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+OFFICIAL_EVALUATOR_URL = (
+    "https://korquad.github.io/dataset/KorQuAD_2.0/evaluate-2.0.py"
+)
 
 
 def _first_answer(qa: Mapping[str, Any]) -> str:
@@ -345,6 +353,275 @@ def _official_original_prediction_map(
     return _official_prediction_map(rows, "prediction")
 
 
+def _official_gold_qa(raw_qa: Mapping[str, Any]) -> Dict[str, Any] | None:
+    """Convert compact or SQuAD-shaped QA metadata to KorQuAD evaluator form."""
+    question_id = str(raw_qa.get("id") or raw_qa.get("question_id") or "").strip()
+    question = str(raw_qa.get("question") or "").strip()
+    if not question_id or not question:
+        return None
+
+    answers = raw_qa.get("answers")
+    answer_text = ""
+    answer_start: Any = None
+    if isinstance(answers, list):
+        for answer in answers:
+            if isinstance(answer, Mapping):
+                candidate = str(answer.get("text") or "")
+                if candidate:
+                    answer_text = candidate
+                    answer_start = answer.get("answer_start")
+                    break
+            elif str(answer):
+                answer_text = str(answer)
+                break
+    if not answer_text:
+        raw_answer = raw_qa.get("answer")
+        if isinstance(raw_answer, Mapping):
+            answer_text = str(raw_answer.get("text") or "")
+            answer_start = raw_answer.get("answer_start")
+        elif raw_answer is not None:
+            answer_text = str(raw_answer)
+    if not answer_text:
+        return None
+
+    answer: Dict[str, Any] = {"text": answer_text}
+    if answer_start is not None:
+        answer["answer_start"] = answer_start
+    return {"id": question_id, "question": question, "answer": answer}
+
+
+def _official_documents_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Flatten both official KorQuAD and SQuAD-style JSON into evaluator docs."""
+    if isinstance(payload, Mapping):
+        items = payload.get("data", [])
+    else:
+        items = payload
+    if not isinstance(items, list):
+        return []
+
+    documents: List[Dict[str, Any]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            continue
+        title = str(item.get("title") or f"article_{index:06d}")
+        if "context" in item:
+            raw_documents = [item]
+        else:
+            paragraphs = item.get("paragraphs", [])
+            raw_documents = paragraphs if isinstance(paragraphs, list) else []
+        for paragraph in raw_documents:
+            if not isinstance(paragraph, Mapping):
+                continue
+            raw_qas = paragraph.get("qas", [])
+            if not isinstance(raw_qas, list):
+                continue
+            qas = [
+                converted
+                for raw_qa in raw_qas
+                if isinstance(raw_qa, Mapping)
+                for converted in [_official_gold_qa(raw_qa)]
+                if converted is not None
+            ]
+            if qas:
+                documents.append(
+                    {
+                        "title": title,
+                        "context": str(paragraph.get("context") or ""),
+                        "qas": qas,
+                    }
+                )
+    return documents
+
+
+def _load_official_gold_documents(
+    source: Path | None,
+    passages: Sequence[Mapping[str, Any]],
+    selected_question_ids: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Load/filter gold data, falling back to the compact QA input when needed."""
+    if source is None:
+        documents: List[Dict[str, Any]] = []
+        for passage in passages:
+            qas = [
+                converted
+                for raw_qa in passage.get("qas", [])
+                if isinstance(raw_qa, Mapping)
+                for converted in [_official_gold_qa(raw_qa)]
+                if converted is not None
+            ]
+            if qas:
+                documents.append(
+                    {
+                        "title": str(passage.get("passage_id") or ""),
+                        "context": str(
+                            passage.get("qa_context") or passage.get("context") or ""
+                        ),
+                        "qas": qas,
+                    }
+                )
+    else:
+        source = source.expanduser()
+        if not source.exists():
+            raise FileNotFoundError(f"공식 KorQuAD gold 경로가 없습니다: {source}")
+        paths = (
+            sorted(source.rglob("*.json"))
+            if source.is_dir()
+            else [source]
+        )
+        if not paths:
+            raise FileNotFoundError(f"gold 경로에 JSON이 없습니다: {source}")
+        documents = []
+        for path in paths:
+            documents.extend(_official_documents_from_payload(_read_json(path)))
+
+    selected = {str(question_id) for question_id in selected_question_ids}
+    filtered: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for document in documents:
+        qas = []
+        for qa in document["qas"]:
+            question_id = str(qa["id"])
+            if question_id not in selected:
+                continue
+            if question_id in seen:
+                raise ValueError(f"공식 gold에 질문 ID가 중복됩니다: {question_id}")
+            seen.add(question_id)
+            qas.append(qa)
+        if qas:
+            filtered.append(
+                {
+                    "title": document.get("title", ""),
+                    "context": document.get("context", ""),
+                    "qas": qas,
+                }
+            )
+    missing = sorted(selected - seen)
+    if missing:
+        raise ValueError(
+            "공식 gold에서 평가 질문을 찾지 못했습니다: "
+            f"{missing[:5]} (총 {len(missing)}개)"
+        )
+    return filtered
+
+
+def _prepare_official_gold(
+    source: Path | None,
+    passages: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> tuple[Path, int]:
+    """Write a one-file gold directory accepted by the official evaluator."""
+    selected_ids = question_ids(passages)
+    documents = _load_official_gold_documents(source, passages, selected_ids)
+    gold_dir = output_dir / "official_gold"
+    gold_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        gold_dir / "gold.json",
+        {"version": "KorQuAD_v2.0", "data": documents},
+    )
+    return gold_dir, len(selected_ids)
+
+
+def _ensure_official_evaluator(
+    requested: Path | None,
+    output_dir: Path,
+) -> Path:
+    """Resolve a local evaluator or cache the official KorQuAD script."""
+    if requested is not None:
+        evaluator = requested.expanduser()
+        if not evaluator.is_file():
+            raise FileNotFoundError(f"공식 evaluator 파일이 없습니다: {evaluator}")
+        return evaluator.resolve()
+
+    evaluator = output_dir / "evaluate-korquad_2.0.py"
+    if evaluator.is_file():
+        return evaluator
+    try:
+        with urlopen(OFFICIAL_EVALUATOR_URL, timeout=60) as response:
+            content = response.read()
+    except Exception as exc:
+        raise RuntimeError(
+            "공식 KorQuAD evaluator를 내려받지 못했습니다. "
+            "인터넷 연결을 확인하거나 --official-evaluator로 로컬 파일을 지정하세요."
+        ) from exc
+    if b"def evaluate" not in content or b"KorQuAD" not in content:
+        raise RuntimeError(
+            "다운로드한 파일이 KorQuAD 공식 evaluator로 보이지 않습니다: "
+            f"{OFFICIAL_EVALUATOR_URL}"
+        )
+    evaluator.write_bytes(content)
+    return evaluator
+
+
+def _parse_official_metrics(stdout: str) -> Dict[str, float]:
+    """Parse the JSON/Python-dict line printed by the official script."""
+    candidates = [line.strip() for line in stdout.splitlines() if line.strip()]
+    for candidate in reversed(candidates):
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                payload = loader(candidate)
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(payload, Mapping) and {"exact_match", "f1"}.issubset(
+                payload
+            ):
+                return {
+                    "exact_match": float(payload["exact_match"]),
+                    "f1": float(payload["f1"]),
+                }
+    raise RuntimeError(
+        "공식 KorQuAD evaluator 출력에서 exact_match/f1을 찾지 못했습니다: "
+        f"{stdout[-500:]}"
+    )
+
+
+def _run_official_evaluator(
+    evaluator: Path,
+    gold_dir: Path,
+    prediction_path: Path,
+    result_path: Path,
+) -> Dict[str, float]:
+    """Run the official script and persist its raw output and EM/F1."""
+    # The upstream script opens JSON files without an explicit encoding.  Force
+    # UTF-8 so the same Korean gold/prediction files work on Windows (cp949
+    # locale) as well as on Colab/Linux.
+    command = [
+        sys.executable,
+        "-X",
+        "utf8",
+        str(evaluator),
+        str(gold_dir),
+        str(prediction_path),
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "공식 KorQuAD evaluator 실행에 실패했습니다. "
+            f"returncode={completed.returncode}\n{completed.stderr.strip()}"
+        )
+    metrics = _parse_official_metrics(completed.stdout)
+    _write_json(
+        result_path,
+        {
+            "evaluator": str(evaluator),
+            "gold_dir": str(gold_dir),
+            "prediction_file": str(prediction_path),
+            "command": command,
+            "exact_match": metrics["exact_match"],
+            "f1": metrics["f1"],
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    return metrics
+
+
 def _release_model_memory() -> None:
     """Release cached model allocations before loading the QA reader."""
     import gc
@@ -623,6 +900,8 @@ def _matched_qa(
         for metric in (
             "answer_survival_rate",
             "empty_prediction_rate",
+            "official_exact_match",
+            "official_f1",
         ):
             s_raw = span_row.get(metric)
             t_raw = token_row.get(metric)
@@ -641,6 +920,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chunks", type=Path, required=True)
     parser.add_argument("--qa-pairs", type=Path, required=True)
+    parser.add_argument(
+        "--gold-json",
+        "--korquad-gold",
+        dest="gold_json",
+        type=Path,
+        help=(
+            "공식 KorQuAD gold JSON 또는 JSON 디렉터리. 생략하면 "
+            "qa-pairs 옆의 gold_subset.json을 사용하고, 없으면 qa-pairs에서 자동 생성합니다."
+        ),
+    )
+    parser.add_argument(
+        "--official-evaluator",
+        type=Path,
+        help=(
+            "공식 evaluate-2.0.py 경로. 생략하면 KorQuAD 공식 URL에서 "
+            "output-dir에 자동으로 내려받습니다."
+        ),
+    )
+    parser.add_argument(
+        "--skip-official-eval",
+        action="store_true",
+        help="공식 EM/F1 평가를 생략합니다(기본값은 자동 실행).",
+    )
     parser.add_argument("--span-records", type=Path, required=True)
     parser.add_argument("--span-predictions", type=Path, required=True)
     parser.add_argument(
@@ -726,6 +1028,32 @@ def main() -> None:
     if missing:
         raise KeyError(f"chunks.csv에 없는 QA passage가 있습니다: {missing[:5]}")
 
+    output_dir = args.output_dir.expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    official_gold_dir: Path | None = None
+    official_evaluator: Path | None = None
+    official_gold_questions = 0
+    if not args.skip_official_eval:
+        gold_source = args.gold_json
+        if gold_source is None:
+            adjacent_gold = args.qa_pairs.expanduser().with_name("gold_subset.json")
+            if adjacent_gold.is_file():
+                gold_source = adjacent_gold
+        official_gold_dir, official_gold_questions = _prepare_official_gold(
+            gold_source,
+            passages,
+            output_dir,
+        )
+        official_evaluator = _ensure_official_evaluator(
+            args.official_evaluator,
+            output_dir,
+        )
+        print(
+            "공식 KorQuAD evaluator 준비 완료: "
+            f"{official_gold_questions}개 질문, {official_evaluator}",
+            flush=True,
+        )
+
     records = read_jsonl(args.span_records)
     predictions = load_span_predictions(args.span_predictions)
     spans_by_chunk = build_spans_by_chunk(records, predictions, chunks)
@@ -794,8 +1122,6 @@ def main() -> None:
                     )
                 )
 
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
         output_dir / "qa_question_ids.json",
         {
@@ -835,15 +1161,33 @@ def main() -> None:
             key = (passage_id, question_id)
             original_predictions[key] = prediction
 
-    summaries: List[Dict[str, Any]] = [
-        _original_summary(
-            passages,
-            chunks,
-            original_predictions,
-            args.qwen_model,
+    original_summary = _original_summary(
+        passages,
+        chunks,
+        original_predictions,
+        args.qwen_model,
+    )
+    original_summary["official_exact_match"] = ""
+    original_summary["official_f1"] = ""
+    summaries: List[Dict[str, Any]] = [original_summary]
+
+    def attach_official_metrics(
+        summary: Dict[str, Any],
+        setting: str,
+        prediction_path: Path,
+    ) -> None:
+        if args.skip_official_eval:
+            return
+        if official_evaluator is None or official_gold_dir is None:
+            raise RuntimeError("공식 evaluator 준비 상태가 올바르지 않습니다.")
+        metrics = _run_official_evaluator(
+            official_evaluator,
+            official_gold_dir,
+            prediction_path,
+            output_dir / f"qa_official_eval_{setting}.json",
         )
-    ]
-    _write_json(output_dir / "qa_original_summary.json", summaries[0])
+        summary["official_exact_match"] = metrics["exact_match"]
+        summary["official_f1"] = metrics["f1"]
 
     def save_setting(
         setting: str,
@@ -880,14 +1224,18 @@ def main() -> None:
                 }
             )
         summary["qwen_model"] = args.qwen_model
+        summary["official_exact_match"] = ""
+        summary["official_f1"] = ""
         _write_json(output_dir / f"qa_eval_{setting}.json", eval_passages)
+        prediction_path = output_dir / f"qa_predictions_{setting}.json"
+        _write_json(
+            prediction_path,
+            _official_prediction_map(question_rows, "pred_compressed"),
+        )
+        attach_official_metrics(summary, setting, prediction_path)
         _write_json(
             output_dir / f"qa_results_{setting}.json",
             {"per_question": question_rows, "summary": summary},
-        )
-        _write_json(
-            output_dir / f"qa_predictions_{setting}.json",
-            _official_prediction_map(question_rows, "pred_compressed"),
         )
         summaries.append(summary)
 
@@ -896,11 +1244,13 @@ def main() -> None:
         save_setting(setting, method, rows, metadata)
         print(f"[QA] {method}/{setting} 완료", flush=True)
 
-    write_csv(output_dir / "qa_summary.csv", summaries)
-    write_csv(
-        output_dir / "qa_matched_retention.csv",
-        _matched_qa(summaries, retention_rates),
+    original_prediction_path = output_dir / "qa_predictions_original.json"
+    _write_json(
+        original_prediction_path,
+        _official_original_prediction_map(passages, original_predictions),
     )
+    attach_official_metrics(original_summary, "original", original_prediction_path)
+    _write_json(output_dir / "qa_original_summary.json", original_summary)
     _write_json(
         output_dir / "qa_original_predictions.json",
         {
@@ -908,13 +1258,21 @@ def main() -> None:
             for (passage_id, question_id), prediction in original_predictions.items()
         },
     )
-    _write_json(
-        output_dir / "qa_predictions_original.json",
-        _official_original_prediction_map(passages, original_predictions),
+    write_csv(output_dir / "qa_summary.csv", summaries)
+    write_csv(
+        output_dir / "qa_matched_retention.csv",
+        _matched_qa(summaries, retention_rates),
+    )
+    run_config = vars(args).copy()
+    run_config["resolved_official_evaluator"] = (
+        str(official_evaluator) if official_evaluator is not None else ""
+    )
+    run_config["official_gold_dir"] = (
+        str(official_gold_dir) if official_gold_dir is not None else ""
     )
     _write_json(
         output_dir / "run_config.json",
-        vars(args),
+        run_config,
     )
     print(f"KorQuAD 재평가 결과 저장: {output_dir}")
 
