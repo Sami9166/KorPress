@@ -28,6 +28,7 @@ KorPress는 여러 어절로 구성된 span을 압축 단위로 사용합니다.
 
 ### Span Candidate Construction
 먼저 문장을 어절 단위로 나눕니다.
+
 $x = (w_1, w_2, ..., w_n)$
 
 그 후, Stanza 의존구문 분석기를 사용해 dependency tree를 얻습니다. 해당 tree에서 부모-자식으로 연결된 어절 구간을 span 후보로 만듭니다.
@@ -42,20 +43,24 @@ $s_{i:j} = (w_i, ...m w_j), \ 1 \leq |s_{i:j}| \leq L$
 
 ### Span Representation
 KLUE-RoBERTa-base의 경우 토큰 기반으로 작동하기 떄문에 span 단위를 학습하기 위해선 서브워드의 임베딩 벡터를 묶어서 봐야합니다. 즉, 하나의 span에 여러 개의 subword vector가 있으므로 span representation을 계산할 필요가 있습니다. 
-$T_s = {h_1, h_2, ..., h_k}$
+
+$$T_s = \{ h_1, h_2, ..., h_k \}$$
 
 span representation의 경우, subword token vector의 전체적인 의미와 두드러지는 특징을 살펴보기 위해 mean pooling과 max pooling을 concat하여 사용합니다.
 
-$h_s^{mean} = \frac{1}{|T_s|}\sum_{t \in T_s}h_t$
-$h_s^{max}[k]= \max_{t\in T_s}h_t[k]$
-$z_s = [h_s^{mean};h_s^{max}]$
+$$h_s^{mean} = \frac{1}{|T_s|}\sum_{t \in T_s}h_t$$
+
+$$h_s^{max}[k]= \max_{t\in T_s}h_t[k]$$
+
+$$z_s = [h_s^{mean};h_s^{max}]$$
 
 ### Training
 전체적인 학습 과정은 [LLMLingua-2](https://aclanthology.org/2024.findings-acl.57/)를 참조하였습니다.
 GPT-5.6-sol-high를 teacher model로 사용해 각 span에 KEEP 또는 DROP 라벨을 생성합니다. 이후 MLP classifier와 encoder를 fine-tuning하며 span별 corss-entropy loss로 DROP 확률을 학습하게 됩니다.
 
-$p_s=\mathrm{softmax}(f_\theta(z_s))$
-$\mathcal{L} = -\sum_s \log p_\theta(y_s|z_s)$
+$$p_s=\mathrm{softmax}(f_\theta(z_s))$$
+
+$$\mathcal{L} = -\sum_s \log p_\theta(y_s|z_s)$$
 
 학습 데이터의 경우에는 [AI Hub 한국어 강의 발화 데이터](https://www.aihub.or.kr/aihubdata/data/view.do?aihubDataSe=data&currMenu=11&dataSetSn=71627&topMenu=)의 train split을 사용하였고, Stanza로 생성한 모든 span에 KEEP/DROP label을 부착하였습니다.
 
@@ -63,21 +68,20 @@ $\mathcal{L} = -\sum_s \log p_\theta(y_s|z_s)$
 추론 시에도 학습과 동일하게 Stanza로 구문분석하여 span 후보를 생성합니다. 그 후 학습된 encoder가 각 span의 $p_{DROP}$을 계산합니다.
 하나의 어절 $w_i$은 여러 개의 span에 포함될 수 있으므로, span별 DROP 확률을 어절 단위 삭제 점수로 통합하였습니다. 어절 $w_i$를 포함하는 span 집합을 
 
-$S_i = {s | w_i \in s}$라고 하자.
+$S_i = {{s | w_i \in s}}$라고 하자.
 
 #### Max
-$q_i^{max} = max_{s \in S_i} p_{DROP}(s)$
+$$q_i^{max} = max_{s \in S_i} p_{DROP}(s)$$
 
 어절을 포함하는 span 중 하나라도 높은 DROP 확률을 가지면 해당 어절을 삭제한다.
 
 #### Mean
-$q_i^{mean} = \frac{1}{|S_i|}\sum_{s \in S_i}p_{DROP}(s)$
+$$q_i^{mean} = \frac{1}{|S_i|}\sum_{s \in S_i}p_{DROP}(s)$$
 
 어절을 포함하는 모든 span의 DROP 확률을 평균내어 삭제 여부를 결정한다.
 
 #### Min
-$q_i^{\mathrm{min}}=
-\min_{s\in\mathcal{S}_i}p_{\mathrm{DROP}}(s)$
+$$q_i^{\mathrm{min}} = \min_{s \in S_i}p_{\mathrm{DROP}}(s)$$
 
 어절을 포함하는 span 중 가장 낮은 DROP 확률을 사용한다. 따라서 집합 내 모든 span이 해당 어절을 불필요하다고 판단해야 삭제된다.
 
