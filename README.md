@@ -1,6 +1,7 @@
 # KorPress: A Syntax-Aware Span Compressor for Korean Prompts
 
 📢 2026년 여름학기 [AIKU](https://github.com/AIKU-Official) 활동으로 진행한 프로젝트입니다.
+
 🏆 2026년 여름 AIKU 프로젝트 **1등 수상**
 
 KorPress는 한국어 문장을 **구문(span)** 단위로 압축하는 prompt compressor입니다. Stanza 의존구문 분석으로 span 후보를 만들고, KLUE-RoBERTa로 각 span의 KEEP/DROP 확률을 예측합니다.
