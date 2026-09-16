@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
-try:  # Running from a script with ``src`` on sys.path
+try:  # Running from an entry point with compressor on sys.path
     from compressor import compress, compress_to_retention
     from token_baseline import TokenBaselineCompressor
 except ImportError:  # Running as an imported package

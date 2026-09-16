@@ -2,7 +2,7 @@
 
 Example::
 
-    python script/token_baseline.py \
+    python intrinsic/token_baseline.py \
       --chunks data/aihub/chunks.csv \
       --labels data/subword_labels.csv.gz \
       --split-manifest data/aihub/split_manifest.csv \
@@ -11,7 +11,7 @@ Example::
 
 Prediction example::
 
-    python script/token_baseline.py predict \
+    python intrinsic/token_baseline.py predict \
       --checkpoint runs/token_klue_roberta_base/best_model \
       --chunks data/aihub/chunks.csv \
       --output runs/aihub/token_predictions.jsonl
@@ -32,9 +32,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+COMPRESSOR_DIR = Path(__file__).resolve().parents[1] / "compressor"
+if str(COMPRESSOR_DIR) not in sys.path:
+    sys.path.insert(0, str(COMPRESSOR_DIR))
 
 from experiment_runtime import load_chunks, write_jsonl
 from token_baseline import (

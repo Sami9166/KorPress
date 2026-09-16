@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Iterator
 import sys
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+COMPRESSOR_DIR = Path(__file__).resolve().parents[1] / "compressor"
+if str(COMPRESSOR_DIR) not in sys.path:
+    sys.path.insert(0, str(COMPRESSOR_DIR))
 
 import torch
 from torch.optim import AdamW

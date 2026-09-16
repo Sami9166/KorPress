@@ -23,8 +23,14 @@ grid_results/
 external/
 wandb/
 mlruns/
-experiments/**/results/
-experiments/**/raw/
+intrinsic/results/
+intrinsic/raw/
+qa_task/results/
+qa_task/raw/
+token_efficiency/results/
+token_efficiency/raw/
+token_efficiency/data/
+token_efficiency/figs/
 
 # Model/checkpoint files
 *.pt
@@ -33,6 +39,8 @@ experiments/**/raw/
 *.safetensors
 *.ckpt
 *.zip
+*.pptx
+*.pdf
 encoder/
 
 # External/private data

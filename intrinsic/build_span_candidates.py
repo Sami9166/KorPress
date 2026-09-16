@@ -3,7 +3,7 @@
 전체 파이프라인: 문장들 -> dependency parsing -> L값별 span 후보 -> JSON 저장
 
 사용법 (최초 1회 한국어 Stanza 모델 다운로드 필요):
-    python script/build_span_candidates.py --input sentences.txt --output result.json
+    python intrinsic/build_span_candidates.py --input sentences.txt --output result.json
 
 sentences.txt: 한 줄에 문장 하나씩
 """
@@ -15,9 +15,9 @@ import sys
 from pathlib import Path
 from typing import List
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+COMPRESSOR_DIR = Path(__file__).resolve().parents[1] / "compressor"
+if str(COMPRESSOR_DIR) not in sys.path:
+    sys.path.insert(0, str(COMPRESSOR_DIR))
 
 from dependency_spans import KoreanDependencyParser, download_korean_model, generate_all_spans
 
