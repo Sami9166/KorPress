@@ -14,24 +14,6 @@ env/
 ENV/
 .ipynb_checkpoints/
 
-# Local experiment artifacts
-runs/
-outputs/
-checkpoints/
-prepared/
-grid_results/
-external/
-wandb/
-mlruns/
-intrinsic/results/
-intrinsic/raw/
-qa_task/results/
-qa_task/raw/
-token_efficiency/results/
-token_efficiency/raw/
-token_efficiency/data/
-token_efficiency/figs/
-
 # Model/checkpoint files
 *.pt
 *.pth

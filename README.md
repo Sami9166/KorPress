@@ -1,4 +1,4 @@
-# KorPress
+# KorPress: A Syntax-Aware Span Compressor for Korean Prompts
 
 📢 2026년 여름학기 [AIKU](https://github.com/AIKU-Official) 활동으로 진행한 프로젝트입니다.
 🏆 2026년 여름 AIKU 프로젝트 **1등 수상**
